@@ -66,7 +66,9 @@ class SmoothedValue:
 
     @property
     def global_avg(self) -> float:
-        return self.total / self.count
+        # A meter registered up front but never updated has count 0. That is not
+        # worth killing a multi-hour run over -- report it as nan instead.
+        return self.total / self.count if self.count else float("nan")
 
     @property
     def max(self) -> float:

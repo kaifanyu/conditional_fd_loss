@@ -21,6 +21,14 @@ set -euo pipefail
 : "${NUM_IMAGES:=50000}"
 
 EXTRA=()
+EXTRA_FLAGS=()
+if [[ -n "${MODELS:-}" ]]; then
+    EXTRA_FLAGS+=(--models $MODELS)
+fi
+if [[ -n "${SAVE_FEATURES:-}" ]]; then
+    EXTRA_FLAGS+=(--save_features $SAVE_FEATURES)
+fi
+
 case "$PRESET" in
     pMF_B_256) MODEL=pMF_B; CFG=8.5; INTERVAL_MIN=0.1; INTERVAL_MAX=0.7
         EXTRA=(--rope_2d --learned_pe --disable_v_head) ;;
@@ -63,7 +71,9 @@ torchrun --nproc_per_node="$GPUS_PER_NODE" --master_port="$MASTER_PORT" \
     --disable_wandb --no_prc \
     --eval_bsz "$EVAL_BSZ" \
     --num_images_for_eval_and_search "$NUM_IMAGES" \
+    --num_images "$NUM_IMAGES" \
     --load_from "$CKPT_PATH" \
     --output_dir "$RESULT_ROOT" \
     --project "$PROJECT" \
+    "${EXTRA_FLAGS[@]}" \
     --exp_name "$EXP_NAME"

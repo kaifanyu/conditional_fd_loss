@@ -1,0 +1,887 @@
+"""Differentiable binary VLM judge for JiT's conditional FD fine-tuning.
+
+This module adapts the VLM supervision idea in *Learning an Image Editing
+Model without Image Editing Pairs* to the class-conditional JiT experiment.
+The editing paper asks a frozen vision-language model (VLM) questions about
+the desired result and differentiates a short answer score with respect to the
+image.  Here, an ImageNet label supplies the desired result: for label ``y``
+we ask whether the generated image depicts ``classname[y]`` and score the
+one-token answer ``Yes`` against ``No``.
+
+There are two question modes:
+
+``target_only``
+    Ask only the positive question for the requested class.  Its correct
+    answer is Yes.
+
+``pairwise_balanced`` (recommended)
+    Ask both the positive question and a second question about a different
+    ImageNet class.  The correct answers are respectively Yes and No.  Their
+    log probabilities receive equal weight.  This cancels much of a VLM's
+    generic Yes/No response bias and makes "always answer Yes" insufficient.
+
+If ``a_Y`` and ``a_N`` are the next-token logits for the two answer tokens,
+the positive-question score is
+
+    log p(correct | image, question) = log sigmoid(a_Y - a_N),
+
+and the negative-question score swaps the two logits.  The VLM is run with a
+normal differentiable ``forward`` call.  This file deliberately never calls
+``generate`` and never wraps VLM scoring in ``torch.no_grad``.
+
+Why this is not the ``vllm`` inference server
+---------------------------------------------
+The similarly named ``vllm`` package is an optimized text-generation server.
+Its RPC/generation boundary does not expose gradients with respect to input
+pixels, so it cannot train the image generator with this loss.  ``BinaryVLMJudge``
+instead loads one local Hugging Face VLM through
+``AutoModelForImageTextToText`` on the current CUDA device.  Its parameters
+are frozen, but autograd remains enabled for the image tensor.
+
+Memory-safe first-order gradient injection
+------------------------------------------
+A VLM can be much larger than the generator.  Retaining its activation graph
+until JiT's final ``loss.backward()`` is unnecessarily expensive.  For a
+small selected subset I, this module therefore:
+
+1. makes a detached leaf ``x' = stopgrad(x).requires_grad_(True)``;
+2. runs VLM microbatches and immediately takes image VJPs
+   ``g = d L_vlm(x') / d x'``;
+3. releases each VLM graph; and
+4. returns the first-order surrogate
+
+       L_sur = stopgrad(L_vlm)
+             + sum_i <x_i - stopgrad(x_i), stopgrad(g_i)>.
+
+At the current images, ``L_sur`` has exactly the VLM loss value and exactly
+the selected-sample first derivative with respect to JiT's images, while no
+VLM activations survive into the generator backward pass.  This is an exact
+first-order VJP surrogate, not a higher-order differentiable loss.
+
+Compatibility and invariants
+----------------------------
+The implementation targets Transformers >= 5.5 and explicitly requests its
+torchvision image-processing backend.  Generated images must be floating
+NCHW RGB tensors in [0, 1].  ``do_rescale=False`` is mandatory for this range.
+After every processor call, the resulting pixel tensor is asserted to still
+require gradients; a PIL/NumPy/slow processor therefore fails loudly instead
+of silently disabling training.  The model and processor are loaded with
+``local_files_only=True``: download the checkpoint beforehand and pass either
+its local directory or an already-populated Hugging Face cache identifier.
+
+The class intentionally has no dependency on the existing CLIP/classifier
+ensemble module.  A training-loop adapter should detect ``is_vlm_judge`` and
+call ``conditional_loss`` directly.  The returned pair is
+
+    (loss_scalar_with_surrogate_gradient, raw_mean_logp_correct_tensor).
+
+``handles_cap=True`` tells the old loop not to apply another confidence cap.
+``last_stats`` remains a plain float dictionary for the existing logger.
+"""
+
+from __future__ import annotations
+
+import math
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple, Union
+
+import torch
+import torch.nn.functional as F
+
+
+_DTYPES = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "fp32": torch.float32,
+    "float32": torch.float32,
+}
+
+_QUESTION_MODES = {
+    "target": "target_only",
+    "target_only": "target_only",
+    "pairwise": "pairwise_balanced",
+    "pairwise_balanced": "pairwise_balanced",
+}
+
+
+def _load_class_names(
+    classnames_file: Optional[Union[str, Path]], num_classes: int
+) -> List[str]:
+    """Load an exact index-to-name table for the conditioning labels."""
+    if classnames_file is not None:
+        path = Path(classnames_file).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"VLM class-name file does not exist or is not a file: {path}"
+            )
+        with path.open("r", encoding="utf-8") as handle:
+            names = [line.strip() for line in handle if line.strip()]
+    else:
+        try:
+            from torchvision.models import ResNet50_Weights
+
+            names = list(ResNet50_Weights.IMAGENET1K_V2.meta["categories"])
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not obtain torchvision's standard ImageNet-1K class "
+                "names. Install a compatible torchvision build or pass a "
+                "newline-separated classnames_file."
+            ) from exc
+
+    if len(names) != int(num_classes):
+        source = str(classnames_file) if classnames_file is not None else "torchvision"
+        raise ValueError(
+            f"Expected exactly {num_classes} class names from {source}, "
+            f"but found {len(names)}. Label indices must not be silently "
+            "truncated or reordered."
+        )
+    return names
+
+
+def _augment_view(
+    images: torch.Tensor, noise_std: float, crop_min: float
+) -> torch.Tensor:
+    """Make one differentiable EOT view, matching the classifier experiment."""
+    x = images
+    flip = torch.rand(x.shape[0], device=x.device) < 0.5
+    x = torch.where(flip[:, None, None, None], torch.flip(x, dims=(3,)), x)
+
+    if crop_min < 1.0:
+        _, _, height, width = x.shape
+        # One crop geometry per VLM microbatch keeps this operation inexpensive;
+        # every image still has an independently sampled horizontal flip/noise.
+        scale = float(
+            torch.empty((), device=x.device).uniform_(crop_min, 1.0).item()
+        )
+        crop_h = max(1, int(round(height * scale)))
+        crop_w = max(1, int(round(width * scale)))
+        top = int(
+            torch.randint(
+                0, height - crop_h + 1, (), device=x.device
+            ).item()
+        )
+        left = int(
+            torch.randint(
+                0, width - crop_w + 1, (), device=x.device
+            ).item()
+        )
+        x = x[:, :, top : top + crop_h, left : left + crop_w]
+        x = F.interpolate(
+            x,
+            size=(height, width),
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )
+
+    if noise_std > 0.0:
+        x = (x + noise_std * torch.randn_like(x)).clamp(0.0, 1.0)
+    return x
+
+
+class BinaryVLMJudge(torch.nn.Module):
+    """Frozen local image-to-text model used as a binary differentiable judge.
+
+    Parameters
+    ----------
+    model_name_or_path:
+        Local model directory, or a Hub model ID that is already fully cached.
+        Network downloads are disabled.  Instruct checkpoints from the
+        LLaVA-OneVision and Qwen2.5-VL families are the intended targets.
+    question_mode:
+        ``"target_only"`` or the recommended ``"pairwise_balanced"``.
+    max_samples_per_step:
+        Number K of generated batch elements judged by the VLM.  ``0`` means
+        the full batch.  A round-robin selector avoids perturbing PyTorch's
+        global random stream merely to choose the subset.
+    microbatch_size:
+        Number of images in one VLM forward.  Start at 1.  Pairwise mode makes
+        separate positive and negative forwards, so it does not double peak
+        activation memory.
+    logp_cap:
+        Optional upper cap on each correct-answer log probability.  Values
+        below zero stop pushing already-satisfied questions; ``0`` disables
+        the cap because log probabilities cannot exceed zero.
+    processor_kwargs:
+        Additional local AutoProcessor options, for example Qwen2.5-VL
+        ``{"min_pixels": 224*224, "max_pixels": 256*256}``.  The backend,
+        local-only setting, and gradient-critical rescaling behavior cannot be
+        overridden here.
+    """
+
+    is_vlm_judge = True
+    handles_cap = True
+
+    def __init__(
+        self,
+        model_name_or_path: Union[str, Path],
+        *,
+        num_classes: int = 1000,
+        classnames_file: Optional[Union[str, Path]] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: str = "bf16",
+        question_mode: str = "pairwise_balanced",
+        max_samples_per_step: int = 4,
+        microbatch_size: int = 1,
+        logp_cap: float = 0.0,
+        yes_text: str = "Yes",
+        no_text: str = "No",
+        question_template: Optional[str] = None,
+        processor_kwargs: Optional[Dict[str, object]] = None,
+        trust_remote_code: bool = False,
+        attn_implementation: Optional[str] = None,
+    ) -> None:
+        super().__init__()
+
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "BinaryVLMJudge requires CUDA: the VLM must share the current "
+                "rank's GPU with the differentiable generator."
+            )
+        if device is None or str(device) == "cuda":
+            device = torch.device("cuda", torch.cuda.current_device())
+        else:
+            device = torch.device(device)
+        if device.type != "cuda":
+            raise ValueError(f"BinaryVLMJudge requires a CUDA device, got {device}")
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        if device.index != torch.cuda.current_device():
+            raise ValueError(
+                f"Requested {device}, but this process's current CUDA device "
+                f"is cuda:{torch.cuda.current_device()}. Set the distributed "
+                "rank device before constructing the VLM judge."
+            )
+
+        dtype_key = str(dtype).lower()
+        if dtype_key not in _DTYPES:
+            raise ValueError(
+                f"dtype must be one of {sorted(_DTYPES)}, got {dtype!r}"
+            )
+        compute_dtype = _DTYPES[dtype_key]
+        if compute_dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                "dtype='bf16' was requested, but the current CUDA device does "
+                "not report bfloat16 support. Use dtype='fp16' instead."
+            )
+
+        mode_key = str(question_mode).lower()
+        if mode_key not in _QUESTION_MODES:
+            raise ValueError(
+                "question_mode must be target_only or pairwise_balanced "
+                f"(aliases target/pairwise are accepted), got {question_mode!r}"
+            )
+        if int(num_classes) < 2:
+            raise ValueError("num_classes must be at least 2")
+        if int(max_samples_per_step) < 0:
+            raise ValueError("max_samples_per_step must be >= 0")
+        if int(microbatch_size) < 1:
+            raise ValueError("microbatch_size must be >= 1")
+        if float(logp_cap) > 0.0:
+            raise ValueError(
+                "logp_cap must be <= 0 because a log probability cannot be "
+                "positive; use 0 to disable capping"
+            )
+        if not yes_text or not no_text:
+            raise ValueError("yes_text and no_text must both be non-empty")
+
+        self.num_classes = int(num_classes)
+        self.classnames = _load_class_names(classnames_file, self.num_classes)
+        self.question_mode = _QUESTION_MODES[mode_key]
+        self.max_samples_per_step = int(max_samples_per_step)
+        self.microbatch_size = int(microbatch_size)
+        self.logp_cap = float(logp_cap)
+        self.yes_text = yes_text
+        self.no_text = no_text
+        self.question_template = question_template or (
+            'Is the primary subject of this image the ImageNet class '
+            '"{class_name}"? Answer with exactly Yes or No.'
+        )
+        if "{class_name}" not in self.question_template:
+            raise ValueError(
+                "question_template must contain the {class_name} placeholder"
+            )
+        self.vlm_device = device
+        self.compute_dtype = compute_dtype
+        self.last_stats: Dict[str, float] = {}
+        self.register_buffer(
+            "_sample_cursor", torch.zeros((), dtype=torch.long), persistent=False
+        )
+        self.register_buffer(
+            "_negative_cursor", torch.zeros((), dtype=torch.long), persistent=False
+        )
+
+        try:
+            import transformers
+            from packaging.version import Version
+            from transformers import AutoModelForImageTextToText, AutoProcessor
+        except Exception as exc:
+            raise RuntimeError(
+                "BinaryVLMJudge needs transformers>=5.5, packaging, and "
+                "torchvision. Install them in the training environment before "
+                "constructing the judge."
+            ) from exc
+
+        try:
+            installed = Version(transformers.__version__.split("+", 1)[0])
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not parse transformers version {transformers.__version__!r}"
+            ) from exc
+        if installed < Version("5.5.0"):
+            raise RuntimeError(
+                "BinaryVLMJudge requires transformers>=5.5.0 for the "
+                "torchvision processor backend and differentiable tensor "
+                f"preprocessing; found {transformers.__version__}."
+            )
+
+        proc_kwargs = dict(processor_kwargs or {})
+        forbidden = {
+            "backend",
+            "image_processor_backend",
+            "local_files_only",
+            "trust_remote_code",
+        }
+        overlap = forbidden.intersection(proc_kwargs)
+        if overlap:
+            raise ValueError(
+                "processor_kwargs may not override gradient/safety options: "
+                + ", ".join(sorted(overlap))
+            )
+
+        model_ref = str(model_name_or_path)
+        try:
+            self.processor = AutoProcessor.from_pretrained(
+                model_ref,
+                image_processor_backend="torchvision",
+                local_files_only=True,
+                trust_remote_code=bool(trust_remote_code),
+                **proc_kwargs,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load the local VLM processor from {model_ref!r}. "
+                "Download/cache the complete processor first; runtime network "
+                "downloads are intentionally disabled."
+            ) from exc
+
+        image_processor = getattr(self.processor, "image_processor", None)
+        if image_processor is None:
+            raise TypeError(
+                f"{type(self.processor).__name__} has no image_processor and "
+                "cannot serve as an image-to-text VLM processor."
+            )
+        backend = getattr(image_processor, "backend", None)
+        if backend != "torchvision":
+            raise RuntimeError(
+                "The loaded image processor is not using Transformers' "
+                f"torchvision backend (reported backend={backend!r}). A PIL/"
+                "NumPy backend would detach the generated images."
+            )
+        if not hasattr(self.processor, "apply_chat_template"):
+            raise TypeError(
+                f"{type(self.processor).__name__} does not implement "
+                "apply_chat_template; use an instruct/chat VLM checkpoint."
+            )
+
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if tokenizer is None:
+            raise TypeError("The VLM processor has no tokenizer")
+        # Left padding guarantees that logits[:, -1] predicts the first answer
+        # token for every prompt in a variable-length batch.
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token_id is None:
+                raise ValueError(
+                    "The VLM tokenizer has neither a pad token nor an EOS "
+                    "token that can safely be used for left padding."
+                )
+            tokenizer.pad_token = tokenizer.eos_token
+
+        self.yes_token_id = self._strict_single_token_id(yes_text, "Yes")
+        self.no_token_id = self._strict_single_token_id(no_text, "No")
+        if self.yes_token_id == self.no_token_id:
+            raise ValueError(
+                f"yes_text={yes_text!r} and no_text={no_text!r} resolve to "
+                f"the same token ID {self.yes_token_id}"
+            )
+
+        load_kwargs: Dict[str, object] = {
+            "dtype": compute_dtype,
+            "local_files_only": True,
+            "trust_remote_code": bool(trust_remote_code),
+        }
+        if attn_implementation:
+            load_kwargs["attn_implementation"] = attn_implementation
+        try:
+            self.vlm = AutoModelForImageTextToText.from_pretrained(
+                model_ref, **load_kwargs
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load the local image-to-text model from "
+                f"{model_ref!r}. Confirm that it is supported by "
+                "AutoModelForImageTextToText and that all weight shards are "
+                "already present locally."
+            ) from exc
+
+        self.vlm.to(device)
+        self.vlm.eval()
+        self.vlm.requires_grad_(False)
+        if hasattr(self.vlm.config, "use_cache"):
+            self.vlm.config.use_cache = False
+
+    def _strict_single_token_id(self, text: str, answer_name: str) -> int:
+        tokenizer = self.processor.tokenizer
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.reshape(-1).tolist()
+        if len(token_ids) != 1:
+            pieces = tokenizer.convert_ids_to_tokens(token_ids)
+            raise ValueError(
+                f"The configured {answer_name} answer {text!r} tokenizes to "
+                f"{len(token_ids)} tokens ({pieces}), but binary logit scoring "
+                "requires exactly one. Pass an exact one-token spelling via "
+                f"{answer_name.lower()}_text (a leading space may be needed "
+                "for some tokenizers)."
+            )
+        return int(token_ids[0])
+
+    def train(self, mode: bool = True) -> "BinaryVLMJudge":
+        """Keep the frozen VLM deterministic even if a parent calls train()."""
+        super().train(False)
+        self.vlm.eval()
+        return self
+
+    def _question(self, class_index: int) -> str:
+        return self.question_template.format(
+            class_name=self.classnames[int(class_index)]
+        )
+
+    def _chat_prompt(self, question: str) -> str:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": question},
+                ],
+            }
+        ]
+        try:
+            prompt = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "The VLM chat template could not format a generic one-image "
+                "LLaVA/Qwen-style message. Use an instruct checkpoint whose "
+                "processor includes a multimodal chat_template."
+            ) from exc
+        if not isinstance(prompt, str) or not prompt:
+            raise RuntimeError(
+                "apply_chat_template did not return a non-empty prompt string"
+            )
+        return prompt
+
+    def _prepare_inputs(
+        self, images01: torch.Tensor, questions: Sequence[str]
+    ) -> Dict[str, torch.Tensor]:
+        if len(questions) != images01.shape[0]:
+            raise ValueError(
+                f"Got {len(questions)} questions for {images01.shape[0]} images"
+            )
+        prompts = [self._chat_prompt(question) for question in questions]
+        # A list preserves the one-image-per-conversation association for both
+        # LLaVA-OneVision and Qwen2.5-VL composite processors.
+        image_list = list(images01.unbind(0))
+        try:
+            encoded = self.processor(
+                text=prompts,
+                images=image_list,
+                padding=True,
+                return_tensors="pt",
+                do_rescale=False,
+                device=self.vlm_device,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Differentiable VLM preprocessing failed. Inputs must be "
+                "batched RGB torch tensors in [0,1], and the processor must "
+                "use the torchvision backend. The call deliberately sets "
+                "do_rescale=False to avoid dividing generated images by 255."
+            ) from exc
+
+        inputs: Dict[str, torch.Tensor] = {}
+        for key, value in dict(encoded).items():
+            if torch.is_tensor(value):
+                inputs[key] = value.to(self.vlm_device)
+            else:
+                raise TypeError(
+                    f"Processor output {key!r} has unsupported type "
+                    f"{type(value).__name__}; expected torch.Tensor"
+                )
+
+        pixel_keys = [
+            key
+            for key, value in inputs.items()
+            if key.startswith("pixel_values") and value.is_floating_point()
+        ]
+        if not pixel_keys:
+            raise RuntimeError(
+                "The VLM processor returned no floating pixel_values tensor"
+            )
+        detached = [key for key in pixel_keys if not inputs[key].requires_grad]
+        if detached:
+            raise RuntimeError(
+                "The VLM processor detached the image graph for "
+                f"{detached}. Verify transformers>=5.5, "
+                "image_processor.backend=='torchvision', tensor inputs, and "
+                "do_rescale=False. Continuing would produce no JiT gradient."
+            )
+        return inputs
+
+    def _binary_logp(
+        self,
+        images01: torch.Tensor,
+        questions: Sequence[str],
+        *,
+        correct_yes: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return per-example (log p(correct), p(correct)) from one forward."""
+        inputs = self._prepare_inputs(images01, questions)
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None and not bool(attention_mask[:, -1].all()):
+            raise RuntimeError(
+                "The processor produced right/trailing padding despite "
+                "padding_side='left'; logits[:, -1] would not be the next "
+                "answer-token distribution."
+            )
+
+        autocast = (
+            torch.autocast(
+                device_type="cuda", dtype=self.compute_dtype, enabled=True
+            )
+            if self.compute_dtype in (torch.float16, torch.bfloat16)
+            else nullcontext()
+        )
+        with autocast:
+            outputs = self.vlm(
+                **inputs,
+                use_cache=False,
+                return_dict=True,
+            )
+        logits = getattr(outputs, "logits", None)
+        if logits is None or logits.ndim != 3:
+            raise RuntimeError(
+                "The VLM forward did not return [batch, sequence, vocabulary] "
+                "logits required for next-token binary scoring."
+            )
+        if logits.shape[0] != images01.shape[0]:
+            raise RuntimeError(
+                f"VLM returned batch {logits.shape[0]} for "
+                f"{images01.shape[0]} images"
+            )
+        vocab_size = logits.shape[-1]
+        if max(self.yes_token_id, self.no_token_id) >= vocab_size:
+            raise RuntimeError(
+                "Yes/No token ID exceeds the VLM output vocabulary size; "
+                "the processor tokenizer and model weights do not match."
+            )
+
+        next_logits = logits[:, -1, :].float()
+        yes = next_logits[:, self.yes_token_id]
+        no = next_logits[:, self.no_token_id]
+        margin = yes - no if correct_yes else no - yes
+        return F.logsigmoid(margin), torch.sigmoid(margin)
+
+    def _select_indices(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        count = (
+            batch_size
+            if self.max_samples_per_step == 0
+            else min(batch_size, self.max_samples_per_step)
+        )
+        if count == batch_size:
+            return torch.arange(batch_size, device=device)
+        start = int(self._sample_cursor.item()) % batch_size
+        indices = (torch.arange(count, device=device) + start) % batch_size
+        self._sample_cursor.fill_((start + count) % batch_size)
+        return indices
+
+    def _negative_labels(self, labels: torch.Tensor) -> torch.Tensor:
+        """Choose deterministic, cycling non-target classes without RNG side effects."""
+        # Offsets lie in [1, C-1], so modular addition can never return y.
+        start = int(self._negative_cursor.item()) % (self.num_classes - 1)
+        offsets = (
+            torch.arange(labels.numel(), device=labels.device) + start
+        ) % (self.num_classes - 1) + 1
+        self._negative_cursor.fill_(
+            (start + labels.numel()) % (self.num_classes - 1)
+        )
+        return (labels + offsets) % self.num_classes
+
+    @torch._dynamo.disable
+    def conditional_loss(
+        self,
+        images: torch.Tensor,
+        labels: torch.Tensor,
+        eot_views: int = 1,
+        noise_std: float = 0.0,
+        crop_min: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the capped VLM loss and inject its first-order image VJP.
+
+        Only K selected images enter the VLM, but their mean is an unbiased
+        minibatch estimate because generated batch elements are exchangeable.
+        The returned raw log probability is *uncapped* and detached; use it for
+        monitoring rather than as a second loss.
+        """
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError(
+                f"images must have shape [B,3,H,W], got {tuple(images.shape)}"
+            )
+        if not images.is_floating_point():
+            raise TypeError(f"images must be floating point, got {images.dtype}")
+        if not images.requires_grad:
+            raise RuntimeError(
+                "images.requires_grad is False. BinaryVLMJudge must receive "
+                "the live generated image tensor before it is detached."
+            )
+        if images.device != self.vlm_device:
+            raise ValueError(
+                f"Images are on {images.device}, but the VLM is on "
+                f"{self.vlm_device}"
+            )
+        if labels.ndim != 1 or labels.shape[0] != images.shape[0]:
+            raise ValueError(
+                f"labels must have shape [{images.shape[0]}], got "
+                f"{tuple(labels.shape)}"
+            )
+        if labels.is_floating_point() or labels.is_complex():
+            raise TypeError(f"labels must be an integer tensor, got {labels.dtype}")
+        if labels.numel() == 0:
+            raise ValueError("The VLM conditional batch must not be empty")
+        label_min = int(labels.min().item())
+        label_max = int(labels.max().item())
+        if label_min < 0 or label_max >= self.num_classes:
+            raise ValueError(
+                f"Label range [{label_min}, {label_max}] is outside "
+                f"[0, {self.num_classes - 1}]"
+            )
+        views = int(eot_views)
+        if views < 1:
+            raise ValueError("eot_views must be >= 1")
+        if float(noise_std) < 0.0:
+            raise ValueError("noise_std must be >= 0")
+        if not 0.0 < float(crop_min) <= 1.0:
+            raise ValueError("crop_min must lie in (0, 1]")
+        if not bool(torch.isfinite(images).all()):
+            raise ValueError("images contains NaN or Inf")
+        image_min = float(images.detach().amin())
+        image_max = float(images.detach().amax())
+        if image_min < -1e-4 or image_max > 1.0001:
+            raise ValueError(
+                f"VLM images must be in [0,1], observed "
+                f"[{image_min:.5g}, {image_max:.5g}]"
+            )
+
+        selected = self._select_indices(images.shape[0], images.device)
+        selected_labels = labels.index_select(0, selected).long()
+        negative_labels = (
+            self._negative_labels(selected_labels)
+            if self.question_mode == "pairwise_balanced"
+            else None
+        )
+        question_count = 2 if negative_labels is not None else 1
+        denominator = float(selected.numel() * views * question_count)
+
+        # All aggregates are detached by construction; only the coupling terms
+        # below connect the scalar surrogate back to the original JiT graph.
+        surrogate = images.new_zeros(())
+        raw_logp_sum = images.new_zeros(())
+        p_correct_sum = images.new_zeros(())
+        positive_p_sum = images.new_zeros(())
+        negative_p_sum = images.new_zeros(())
+        cap_hits = images.new_zeros(())
+
+        for start in range(0, selected.numel(), self.microbatch_size):
+            stop = min(start + self.microbatch_size, selected.numel())
+            mb_indices = selected[start:stop]
+            mb_labels = selected_labels[start:stop]
+            mb_negative = (
+                negative_labels[start:stop]
+                if negative_labels is not None
+                else None
+            )
+            # This leaf owns only a tiny image microbatch, never JiT's graph.
+            leaf = (
+                images.index_select(0, mb_indices)
+                .detach()
+                .requires_grad_(True)
+            )
+            leaf_vjp = torch.zeros_like(leaf)
+            chunk_value = images.new_zeros(())
+
+            positive_questions = [
+                self._question(index)
+                for index in mb_labels.detach().cpu().tolist()
+            ]
+            negative_questions = (
+                [
+                    self._question(index)
+                    for index in mb_negative.detach().cpu().tolist()
+                ]
+                if mb_negative is not None
+                else None
+            )
+
+            for _ in range(views):
+                use_aug = (
+                    views > 1 or noise_std > 0.0 or crop_min < 1.0
+                )
+                viewed = (
+                    _augment_view(leaf, float(noise_std), float(crop_min))
+                    if use_aug
+                    else leaf
+                )
+                viewed_vjp = torch.zeros_like(viewed)
+
+                logp, probability = self._binary_logp(
+                    viewed, positive_questions, correct_yes=True
+                )
+                capped = (
+                    torch.clamp(logp, max=self.logp_cap)
+                    if self.logp_cap < 0.0
+                    else logp
+                )
+                term = -capped.sum() / denominator
+                viewed_vjp.add_(
+                    torch.autograd.grad(
+                        term, viewed, create_graph=False, retain_graph=False
+                    )[0]
+                )
+                chunk_value = chunk_value + term.detach()
+                raw_logp_sum = raw_logp_sum + logp.detach().sum()
+                p_correct_sum = p_correct_sum + probability.detach().sum()
+                positive_p_sum = positive_p_sum + probability.detach().sum()
+                if self.logp_cap < 0.0:
+                    cap_hits = cap_hits + (logp.detach() >= self.logp_cap).sum()
+
+                if negative_questions is not None:
+                    logp, probability = self._binary_logp(
+                        viewed, negative_questions, correct_yes=False
+                    )
+                    capped = (
+                        torch.clamp(logp, max=self.logp_cap)
+                        if self.logp_cap < 0.0
+                        else logp
+                    )
+                    term = -capped.sum() / denominator
+                    viewed_vjp.add_(
+                        torch.autograd.grad(
+                            term, viewed, create_graph=False, retain_graph=False
+                        )[0]
+                    )
+                    chunk_value = chunk_value + term.detach()
+                    raw_logp_sum = raw_logp_sum + logp.detach().sum()
+                    p_correct_sum = p_correct_sum + probability.detach().sum()
+                    negative_p_sum = (
+                        negative_p_sum + probability.detach().sum()
+                    )
+                    if self.logp_cap < 0.0:
+                        cap_hits = cap_hits + (
+                            logp.detach() >= self.logp_cap
+                        ).sum()
+
+                if viewed is leaf:
+                    leaf_vjp.add_(viewed_vjp)
+                else:
+                    leaf_vjp.add_(
+                        torch.autograd.grad(
+                            viewed,
+                            leaf,
+                            grad_outputs=viewed_vjp,
+                            create_graph=False,
+                            retain_graph=False,
+                        )[0]
+                    )
+
+            original = images.index_select(0, mb_indices)
+            coupling = (original * leaf_vjp.detach()).sum()
+            # Numerical value == chunk_value; d/doriginal == leaf_vjp.
+            surrogate = (
+                surrogate
+                + chunk_value
+                + coupling
+                - coupling.detach()
+            )
+
+        raw_mean_logp = (raw_logp_sum / denominator).detach()
+        mean_p_correct = (p_correct_sum / denominator).detach()
+        positive_denominator = float(selected.numel() * views)
+        stats = {
+            "logp_vlm": float(raw_mean_logp),
+            "vlm_p_correct": float(mean_p_correct),
+            "vlm_p_yes_target": float(
+                positive_p_sum / positive_denominator
+            ),
+            "vlm_samples": float(selected.numel()),
+            "vlm_questions": float(denominator),
+            "vlm_cap_fraction": float(cap_hits / denominator),
+        }
+        if negative_labels is not None:
+            stats["vlm_p_no_distractor"] = float(
+                negative_p_sum / positive_denominator
+            )
+        self.last_stats = stats
+        return surrogate, raw_mean_logp
+
+    @torch._dynamo.disable
+    def smoke_test_uniform(
+        self, batch_size: int = 1, image_size: int = 256
+    ) -> Dict[str, float]:
+        """Exercise preprocessing, forward, and image VJP on random tensors.
+
+        The compatibility field ``uniform_ref`` is log(1/2), not log(1/1000):
+        this judge normalizes only the Yes/No logits.  Random noise need not
+        actually calibrate to 0.5, so this test validates plumbing and finite
+        gradients rather than semantic accuracy.
+        """
+        if int(batch_size) < 1:
+            raise ValueError("smoke-test batch_size must be >= 1")
+        if int(image_size) < 1:
+            raise ValueError("smoke-test image_size must be >= 1")
+        with torch.enable_grad():
+            images = torch.rand(
+                int(batch_size),
+                3,
+                int(image_size),
+                int(image_size),
+                device=self.vlm_device,
+                requires_grad=True,
+            )
+            labels = torch.arange(
+                int(batch_size), device=self.vlm_device, dtype=torch.long
+            ) % self.num_classes
+            questions = [
+                self._question(index)
+                for index in labels.detach().cpu().tolist()
+            ]
+            logp, probability = self._binary_logp(
+                images, questions, correct_yes=True
+            )
+            gradient = torch.autograd.grad(logp.mean(), images)[0]
+        if gradient is None or not bool(torch.isfinite(gradient).all()):
+            raise RuntimeError("VLM smoke test produced a missing/non-finite image VJP")
+        if not bool(torch.isfinite(logp).all()):
+            raise RuntimeError("VLM smoke test produced non-finite Yes/No scores")
+        return {
+            "mean_logp_per_class": float(logp.detach().mean()),
+            "uniform_ref": math.log(0.5),
+            "max_logp": float(logp.detach().max()),
+            "p_correct": float(probability.detach().mean()),
+        }
+

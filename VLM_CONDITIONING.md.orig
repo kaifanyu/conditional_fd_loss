@@ -1,0 +1,387 @@
+# Single-VLM conditioning for JiT
+
+This experiment keeps the three feature-distance (FD) representation judges
+that enforce ImageNet-like realism:
+
+1. SigLIP SO400M features,
+2. MAE ViT-L features, and
+3. Inception features.
+
+It removes the three *conditional* scorers (OpenCLIP ViT-L/14, ConvNeXt-B, and
+DeiT3-B) and replaces them with one frozen vision-language model (VLM). The
+generator is still optimized by FD plus a semantic condition:
+
+\[
+\mathcal L(\theta)
+=
+\mathcal L_{\mathrm{FD}}(\theta)
++
+\lambda(s)\mathcal L_{\mathrm{VLM}}(\theta).
+\]
+
+This is not a “one judge total” experiment: there are still three FD feature
+judges for realism, plus one VLM for whether an image matches its requested
+class.
+
+With distributed training, “one VLM” means one semantic judge architecture,
+replicated once on each GPU rank. Each copy is frozen: it has no parameter
+gradients, AdamW state, or EMA state. It only supplies a gradient with respect
+to that rank's generated pixels. The normal cross-rank generator-gradient
+average then keeps both JiT replicas synchronized.
+
+## What the paper does
+
+[Learning an Image Editing Model without Image Editing Pairs](https://arxiv.org/abs/2510.14978)
+uses a frozen **LLaVA-OneVision-7B** as a differentiable training-time critic.
+For each generated edit it asks binary natural-language questions about:
+
+- whether the requested edit was performed, and
+- whether unrelated identity/content was preserved.
+
+It does not autoregressively generate an answer during training. A single
+teacher-forced forward pass produces the next-token logits for `Yes` and `No`.
+If \(a\) is the correct answer and \(\bar a\) is the opposite answer, the paper
+uses
+
+\[
+p_{\mathrm{VLM}}(a\mid x,q)
+=
+\frac{\exp \ell_a}
+{\exp \ell_a+\exp \ell_{\bar a}}
+=
+\sigma(\ell_a-\ell_{\bar a}),
+\]
+
+\[
+\mathcal L_{\mathrm{VLM}}
+=
+-\sum_j\log p_{\mathrm{VLM}}(a_j\mid x,q_j).
+\]
+
+The VLM's parameters are frozen, but autograd remains enabled from its answer
+logits back to the input pixels. That pixel gradient updates the image
+generator. The paper combines this semantic loss with a DMD realism loss;
+its ablations report that the VLM loss alone is not a sufficient image prior.
+That is why this adaptation retains the three FD judges.
+
+The paper also uses Qwen2.5-32B offline to help construct editing
+instructions. That model is a data-generation tool, not the differentiable
+training critic.
+
+### VLM versus vLLM
+
+A **VLM** is a vision-language model. **vLLM** is an optimized inference and
+serving engine. A remote vLLM server normally returns detached logits or text;
+it cannot propagate
+\(\partial\mathcal L/\partial x\) through generated image pixels to JiT.
+Therefore this implementation loads the VLM directly in PyTorch on each
+training rank. Replacing it with a vLLM API would require a different,
+gradient-free method such as reinforcement learning.
+
+## How this adaptation differs from the paper
+
+The exact paper checkpoint is LLaVA-OneVision-7B. This repository currently
+uses the complete local **Qwen2.5-VL-7B-Instruct** checkpoint at:
+
+```text
+/home/nvidia/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5
+```
+
+Qwen is a practical local substitute with the same required interface:
+image-plus-question input and differentiable next-token `Yes`/`No` logits. It
+is not a claim of exact reproduction. To reproduce the paper critic, cache
+LLaVA-OneVision-7B locally and set `VLM_MODEL` to that path, after first
+checking that its image processor preserves tensor gradients.
+
+Class generation also has no source/edit pair, so there is no meaningful
+identity-preservation question. The recommended `pairwise` mode instead scores
+two questions for each selected image:
+
+```text
+Target question:
+  Is the primary subject of this image the ImageNet class
+  "golden retriever"? Answer with exactly Yes or No.
+  Correct answer: Yes
+
+Distractor question:
+  Is the primary subject of this image the ImageNet class
+  "airliner"? Answer with exactly Yes or No.
+  Correct answer: No
+```
+
+The non-target class cycles deterministically. If \(y_i\) is the requested
+class and \(\tilde y_i\ne y_i\) is the distractor, then for \(K\) selected
+images the uncapped loss is
+
+\[
+\mathcal L_{\mathrm{VLM}}
+=-\frac{1}{2K}\sum_{i=1}^{K}
+\left[
+\log\sigma(\ell_{\mathrm{Yes}}(x_i,q_{y_i})
+             -\ell_{\mathrm{No}}(x_i,q_{y_i}))
++
+\log\sigma(\ell_{\mathrm{No}}(x_i,q_{\tilde y_i})
+             -\ell_{\mathrm{Yes}}(x_i,q_{\tilde y_i}))
+\right].
+\]
+
+`--cond_target_logp -0.69` applies a confidence cap. A question whose correct
+answer probability has reached approximately
+\(\exp(-0.69)\approx 0.50\) contributes no further gradient. This conservative
+cap reduces pressure to find adversarial patterns that fool the VLM.
+
+Only `--vlm_samples_per_step 2` images per GPU rank are scored by default.
+Pairwise mode asks two questions per selected image, so each rank performs four
+VLM image-question forwards per optimizer step. `--vlm_microbatch 1` means only
+one VLM image activation graph is resident at a time. `--clip_eot_views 1`
+disables extra augmented views; the legacy `clip_eot_*` argument names are
+reused by the generic conditional-loss call.
+
+## Why the memory-saving surrogate is valid
+
+Keeping a 7B VLM graph alive beside the JiT graph and all FD feature graphs can
+exceed GPU memory. The VLM wrapper therefore computes an image-space vector-
+Jacobian product on a detached image microbatch:
+
+\[
+g
+=
+\left.
+\frac{\partial\mathcal L_{\mathrm{VLM}}(x')}
+     {\partial x'}
+\right|_{x'=\operatorname{stopgrad}(x)}.
+\]
+
+It then frees the VLM activation graph and attaches the following scalar to the
+live generated image:
+
+\[
+\mathcal L_{\mathrm{sur}}
+=
+\operatorname{stopgrad}(\mathcal L_{\mathrm{VLM}})
++
+\langle x,g\rangle
+-
+\operatorname{stopgrad}(\langle x,g\rangle).
+\]
+
+Numerically, \(\mathcal L_{\mathrm{sur}}=\mathcal L_{\mathrm{VLM}}\), while
+\(\partial\mathcal L_{\mathrm{sur}}/\partial x=g\). Thus the JiT parameter
+gradient for the current batch is unchanged:
+
+\[
+\frac{\partial\mathcal L_{\mathrm{sur}}}{\partial\theta}
+=g^\top\frac{\partial x}{\partial\theta}.
+\]
+
+This is a first-order gradient handoff, not an approximation based on VLM text
+generation. It intentionally does not retain higher-order derivatives through
+the VLM.
+
+## Installation and startup check
+
+Activate the existing environment and ensure the differentiable Transformers
+processor backend is installed:
+
+```bash
+cd /data/jgu/kai/FD-Loss
+conda activate fdloss
+python -m pip install -r requirements.txt
+```
+
+The VLM wrapper enforces local-only model and processor loading internally; no
+runtime CLI switch is needed. The launcher exits before training if the Qwen
+snapshot or base JiT checkpoint is missing. Unless
+`--vlm_skip_smoke` is explicitly passed, startup also runs a real image-gradient
+smoke check; do not skip it on the first run. The smoke check validates tensor
+preprocessing, next-token scoring, and a finite nonzero pixel gradient. Its
+random image is not a test of the VLM's semantic accuracy.
+
+## Run a short pilot first
+
+Use a separate experiment name and remove the long conditional warmup so the
+VLM path is actually exercised:
+
+```bash
+cd /data/jgu/kai/FD-Loss
+CUDA_GPUS=4,5 \
+MASTER_PORT=29504 \
+EXP_NAME=r4_vlm_qwen_pilot \
+EPOCHS=1 \
+STEPS_PER_EPOCH=200 \
+WARMUP_EPOCHS=0 \
+COND_WARMUP=0 \
+COND_RAMP=100 \
+QUEUE_SIZE=2000 \
+ONLINE_EVAL=0 \
+VLM_SAMPLES=2 \
+LAMBDA_VLM=5e-5 \
+scripts/run_jit_vlm_qwen.sh
+```
+
+Follow its log:
+
+```bash
+tail -f sweep_logs/r4_vlm_qwen_pilot.out
+```
+
+The launcher passes `QUEUE_SIZE` to both the FD queue and the initialization/
+evaluation sample count. The reduced 2,000-sample queue makes this a plumbing
+and gradient-balance test, not a directly comparable final FD experiment.
+`ONLINE_EVAL=0` omits periodic 50,000-image evaluation during this pilot.
+
+Before trusting a long run, verify:
+
+- the startup VLM image-gradient smoke check passes;
+- there are no OOMs or NaNs;
+- `vlm_p_yes_target` and `vlm_p_no_distractor` move upward;
+- held-out probe top-1/top-5 improve, not merely the in-loss VLM score;
+- raw FD metrics do not sharply worsen; and
+- `grad_x_p` is material but does not overwhelmingly dominate `grad_x_fd`.
+
+If memory is tight, keep the microbatch at 1 and lower
+`VLM_SAMPLES=1`. This reduces VLM compute and estimator sample count, not the
+local JiT batch size. Increasing the microbatch changes peak memory; increasing
+`VLM_SAMPLES` changes total VLM forwards per optimizer step.
+
+## Run the full experiment
+
+The launcher defaults match the earlier three-run sweep:
+
+```bash
+cd /data/jgu/kai/FD-Loss
+scripts/run_jit_vlm_qwen.sh
+```
+
+This starts, in the background:
+
+- GPUs `4,5`, two distributed ranks;
+- \(80\times1250=100{,}000\) optimizer steps;
+- local batch 21 per rank, global batch 42;
+- 15,000 steps with no VLM forward or VLM gradient (its frozen weights remain
+  resident);
+- a 20,000-step linear ramp to `LAMBDA_VLM=5e-5`;
+- a 50,000-sample FD queue and online evaluation; and
+- the three original FD representation judges plus one Qwen VLM judge.
+
+Useful safe overrides are:
+
+```bash
+CUDA_GPUS=6,7 MASTER_PORT=29505 EXP_NAME=my_vlm_run \
+VLM_SAMPLES=2 LAMBDA_VLM=5e-5 \
+COND_WARMUP=15000 COND_RAMP=20000 \
+QUEUE_SIZE=50000 ONLINE_EVAL=1 \
+EPOCHS=80 STEPS_PER_EPOCH=1250 \
+scripts/run_jit_vlm_qwen.sh
+```
+
+The default `AUTO_RESUME=1` resumes only inside the same project/experiment
+directory. Use a new `EXP_NAME` for a clean comparison, or set
+`AUTO_RESUME=0`.
+
+## Reading and tuning the result
+
+The important training metrics are:
+
+| Metric | Meaning |
+|---|---|
+| `l_cond` | Capped binary VLM loss actually optimized |
+| `logp_vlm` / `logp_c` | Uncapped mean correct-answer log probability |
+| `vlm_p_correct` | Mean correct-answer probability across both questions |
+| `vlm_p_yes_target` | Probability of Yes for the requested class |
+| `vlm_p_no_distractor` | Probability of No for the non-target class |
+| `vlm_cap_fraction` | Fraction already at the confidence cap |
+| `grad_x_p` | Pixel-gradient norm of the weighted VLM term |
+| `grad_x_fd` | Pixel-gradient norm of the FD term |
+| `cos_update_fd_p` | Alignment of the two pixel-gradient directions |
+| probe top-1/top-5 | Held-out ResNet label accuracy; not used for training |
+| `fid_*` | Raw per-representation FD values |
+
+Because the cap holds every satisfied question at log probability `-0.69`,
+`l_cond` approaches roughly `0.69`, not zero, when all questions are capped.
+Use the uncapped probabilities and `vlm_cap_fraction` to understand progress
+rather than expecting the capped loss to vanish.
+
+The paper's VLM coefficient is not directly portable: it used a different
+generator objective, critic, batch, and loss scaling. An end-to-end one-step
+smoke test at `LAMBDA_VLM=3e-4` measured `grad_x_vlm=0.0320` versus
+`grad_x_fd=0.0196`, a ratio of \(1.63\), with local batch 2, one VLM-scored
+image, and queue size 8. That tiny smoke test is not a final calibration, but it
+shows that `3e-4` can let the VLM dominate. Since the weighted VLM gradient is
+linear in \(\lambda\), `5e-5` predicts
+
+\[
+1.63\frac{5\times10^{-5}}{3\times10^{-4}}\approx0.27.
+\]
+
+That lands near the conservative target range below, so `5e-5` is the safer
+default pilot value. To reproduce `3e-4` as a controlled comparison, use a new
+experiment name explicitly:
+
+```bash
+EXP_NAME=r4_vlm_qwen_lambda3e4 LAMBDA_VLM=3e-4 \
+scripts/run_jit_vlm_qwen.sh
+```
+
+Tune by effect, not by scalar loss values. During the active ramp, compare
+
+\[
+r=\frac{\lVert\nabla_x(\lambda\mathcal L_{\mathrm{VLM}})\rVert_2}
+        {\lVert\nabla_x\mathcal L_{\mathrm{FD}}\rVert_2}
+=\frac{\texttt{grad\_x\_p}}{\texttt{grad\_x\_fd}}.
+\]
+
+As a conservative starting heuristic, target a sustained ratio around
+\(0.1\)–\(0.3\), then judge actual held-out class accuracy and FD. Lower
+`LAMBDA_VLM` if the VLM gradient dominates, FD deteriorates, or images develop
+repeated adversarial textures. Raise it gradually if the probe remains at
+chance and the VLM gradient is negligible. Do not select a checkpoint only
+because `vlm_p_correct` is high: that is the training judge and can be gamed.
+
+## Generate labeled class samples
+
+For a completed default run, generate a labeled grid from an EMA shadow:
+
+```bash
+python generate_samples.py \
+  --model JiT_B --rope_2d --learned_pe --legacy_time_convention \
+  --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
+  --num_sampling_steps 1 \
+  --ckpt work_dirs/JiT_cond_sweep/r4_vlm_qwen/checkpoints/step_0099999.pth \
+  --output_dir eval_out/r4_vlm_qwen \
+  --classes 207 360 387 974 88 \
+  --num_samples 5 \
+  --use_ema --ema_label edm_250 \
+  --gen_seed 42 \
+  --same_noise_across_classes \
+  --label_grid \
+  --grid_title "r4_vlm_qwen — expected ImageNet class"
+```
+
+`all_classes_labeled.png` places the expected ImageNet ID and class name beside
+each row and the fixed-noise index above each column. Keep the same classes,
+`--gen_seed`, `--same_noise_across_classes`, sampling settings, and EMA choice
+when generating a baseline grid; then each cell is a controlled visual
+comparison.
+
+If the chosen checkpoint does not contain `edm_250`, inspect the available
+labels reported by the loader and select one with `--ema_label`, or omit
+`--use_ema` to inspect the online model.
+
+For an independent quantitative class check:
+
+```bash
+python eval_class_accuracy.py \
+  --model JiT_B --rope_2d --learned_pe --legacy_time_convention \
+  --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
+  --num_sampling_steps 1 \
+  --resume_from work_dirs/JiT_cond_sweep/r4_vlm_qwen/checkpoints/step_0099999.pth \
+  --eval_ema_label edm_250 \
+  --eval_classes 207 360 387 974 88 \
+  --eval_per_class 50 \
+  --ext_classifier resnet50
+```
+
+Use the same command on the original unconditional checkpoint and each
+classifier-conditioned run. Report held-out top-1/top-5 together with all three
+FD values and the paired labeled grids.

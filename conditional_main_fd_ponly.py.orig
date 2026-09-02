@@ -1,0 +1,843 @@
+import argparse
+import datetime
+import logging
+import os
+import sys
+import time
+
+import torch
+import torch.distributed
+
+from utils.builders import create_generation_model, create_tokenizer
+from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
+from utils.distributed_util import all_reduce_mean, preempt_requested, register_preempt_handler
+from utils.eval_util import evaluate_all_emas
+from utils.grad_util import get_grad_norm
+from utils.logging_util import MetricLogger, SmoothedValue
+from utils.optimizer_util import create_optimizer
+from frechet_distance.evaluator import FDEvaluator
+from frechet_distance.queue import FeatureQueue
+from frechet_distance.losses import (
+    compute_frechet_distance_loss,
+    diff_all_gather,
+    load_mu_and_sigma_reference, precompute_sigma_ref_sqrt,
+)
+from frechet_distance.repr_models import load_repr_model, model_short_name
+from frechet_distance.judges import (
+    extract_judge_features,
+    resolve_per_model_args, save_fd_queue_states, load_fd_queue_states,
+    fill_all_queues, run_sanity_check,
+)
+from utils.rng_util import RNGStateManager
+from utils.schedule_util import adjust_learning_rate
+from utils.setup_util import setup
+from utils.vis_util import visualize
+
+
+from clip_classifier import CLIPClassifier, assert_clip_grad_flows  # conditional correction
+from classifier_ensemble import ClassifierEnsemble, ProbeClassifier  # multi-classifier p(c|x)
+from vlm_judge import BinaryVLMJudge  # differentiable binary Yes/No VLM critic
+
+
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False
+torch._dynamo.config.capture_scalar_outputs = True
+torch._dynamo.config.cache_size_limit = 128
+torch._dynamo.config.optimize_ddp = False
+
+logger = logging.getLogger("FD_loss")
+
+
+# ---------------------------------------------------------------------------
+# FD train step
+# ---------------------------------------------------------------------------
+
+def cond_lambda_schedule(step, args):
+    """Effective lambda_cond at ``step``: 0 during warmup, then a linear ramp
+    to args.lambda_cond over cond_ramp_steps. Gating the CLIP term until the FD
+    queue is warm (and the generator already makes real images) is what stops
+    the early CLIP-dominated adversarial collapse."""
+    w = getattr(args, "cond_warmup_steps", 0)
+    r = getattr(args, "cond_ramp_steps", 0)
+    if step < w:
+        return 0.0
+    if r <= 0:
+        return args.lambda_cond
+    return args.lambda_cond * min(1.0, (step - w) / float(r))
+
+
+def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
+                      clip_classifier=None, probe=None):
+    fid_norm_eps = args.fd_fid_norm_eps
+    batch_size = args.batch_size
+    num_classes = args.num_classes
+    lambda_cond = args.lambda_cond
+    eot_views = getattr(args, "clip_eot_views", 1)
+    eot_noise = getattr(args, "clip_eot_noise_std", 0.0)
+    eot_crop_min = getattr(args, "clip_eot_crop_min", 1.0)
+    target_logp = getattr(args, "cond_target_logp", 0.0)  # <0 caps confidence
+    if getattr(clip_classifier, "handles_cap", False):
+        target_logp = 0.0  # ensemble caps per member; no outer re-clamp
+    input_shape = (args.input_channels, args.input_size, args.input_size)
+
+    def fd_train_step(lambda_cond_eff=None, diag=False):
+        # scalars come in as 0-dim cuda tensors from the loop (constant value =>
+        # no torch.compile recompiles across the warmup/ramp); fall back to the
+        # python constant if called bare (e.g. the compile warmup before the loop).
+        if lambda_cond_eff is None:
+            lambda_cond_eff = lambda_cond
+        z = torch.randn(batch_size, *input_shape, device="cuda") * args.noise_scale
+        # if clip_classifier is not None:
+        #     y = torch.randint(0, num_classes, (batch_size,), device="cuda")
+        # else:
+            # y = None
+
+        # baseline run
+        y = torch.randint(0, num_classes, (batch_size,), device="cuda")
+        sampled = model_wo_ddp.sample_images_with_grad(z, y, sampling_args=sampling_args)
+
+        if tokenizer is not None:
+            sampled = tokenizer.decode(tokenizer.denormalize_z(sampled))
+        sampled = (sampled * 0.5 + 0.5).clamp(0,1)  # [-1,1] -> [0,1]
+
+        loss = torch.tensor(0.0, device="cuda")
+        loss_dict = {}
+
+        # A large VLM is evaluated before the FD judge graphs are built. Its
+        # implementation takes image-space VJPs in microbatches and injects an
+        # exact first-order surrogate, so the VLM activations are already gone
+        # when the three FD feature extractors run.
+        p_term_loss = None
+        is_vlm = bool(getattr(clip_classifier, "is_vlm_judge", False))
+        if is_vlm:
+            lambda_value = (float(lambda_cond_eff.detach()) if torch.is_tensor(lambda_cond_eff)
+                            else float(lambda_cond_eff))
+            if lambda_value > 0.0:  # skip the expensive VLM during cond warmup
+                l_cond, log_p_c = clip_classifier.conditional_loss(
+                    sampled, y, eot_views=eot_views, noise_std=eot_noise,
+                    crop_min=eot_crop_min)
+                p_term_loss = lambda_cond_eff * l_cond
+                loss = loss + p_term_loss
+                loss_dict.update(l_cond=float(l_cond.detach()), logp_c=float(log_p_c.detach()),
+                                 p_loss_weighted=float(p_term_loss.detach()))
+                loss_dict.update(getattr(clip_classifier, "last_stats", {}))
+
+        all_new_feats = []
+        for judge in judges:
+            feats = extract_judge_features(judge, sampled)
+            new_feats = diff_all_gather(feats)
+            all_new_feats.append(new_feats)
+
+        fd_term = torch.zeros((), device="cuda")
+        fd_raw_sum = 0.0
+        for i, judge in enumerate(judges):
+            new_feats = all_new_feats[i]
+
+            _ns_kwargs = dict(sigma_ref_sqrt=judge.get("sigma_ref_sqrt"))
+            if judge["queue"].online_accum or judge["queue"].ema_stats:
+                mu, sigma = judge["queue"].build_feats_stats(new_feats)
+                fid = compute_frechet_distance_loss(judge["mu_ref"], judge["sigma_ref"],
+                                                    mu=mu, sigma=sigma,
+                                                    **_ns_kwargs)
+            else:
+                all_feats = judge["queue"].build_feats_snapshot(new_feats)
+                fid = compute_frechet_distance_loss(judge["mu_ref"], judge["sigma_ref"],
+                                                    all_feats=all_feats,
+                                                    **_ns_kwargs)
+            fid_loss = fid / (fid.detach() + fid_norm_eps)
+            fd_term = fd_term + judge["weight"] * fid_loss
+            fd_raw_sum += float(fid.detach())
+            loss_dict[f"fid_{judge['name']}"] = float(fid.detach())
+        loss = loss + fd_term
+        loss_dict["fd_loss_raw"] = fd_raw_sum                  # raw Fréchet distance(s), summed
+        loss_dict["fd_loss_norm"] = float(fd_term.detach())   # self-normalized FD term in the loss
+
+        # -- legacy classifier correction: -E[log p(c|x)] --
+        if clip_classifier is not None and not is_vlm:
+            # log p(c|x):
+            log_p_c = clip_classifier.log_p_c_given_x(sampled, y, eot_views=eot_views, noise_std=eot_noise, crop_min=eot_crop_min)  # (B,)
+            # confidence cap: once a sample is this confident it stops pushing
+            p_term = torch.clamp(log_p_c, max=target_logp) if target_logp < 0 else log_p_c
+            l_cond = -p_term.mean()  # flip sign since log-probs are <= 0
+            p_term_loss = lambda_cond_eff * l_cond
+            loss = loss + p_term_loss  # mult with lambda cond eff and add to loss
+            loss_dict["l_cond"] = float(l_cond.detach())
+            loss_dict["logp_c"] = float(log_p_c.mean().detach())
+            loss_dict["p_loss_weighted"] = float(p_term_loss.detach())
+            # per-member logp (ensemble only) — divergence between members is
+            # the signature of one classifier being adversarially satisfied
+            loss_dict.update(getattr(clip_classifier, "last_stats", {}))
+
+        # -- per-term gradient diagnostics on the generated pixels (log-steps only).
+        # Loss *values* are not comparable across terms (FD is self-normalized, p
+        # is not), so we read who actually drives the update from grad-w.r.t.-image
+        # norms; the cosine exposes conflict between the CLIP pull and the FD pull.
+        if diag:
+            def _grad_x(term):
+                if term is None:
+                    return None
+                g = torch.autograd.grad(term, sampled, retain_graph=True,
+                                        allow_unused=True)[0]
+                return None if g is None else g.detach().reshape(-1)
+            g_fd, g_p = _grad_x(fd_term), _grad_x(p_term_loss)
+            def _norm(g):
+                return float(g.norm()) if g is not None else 0.0
+            def _cos(a, b):
+                if a is None or b is None:
+                    return 0.0
+                d = float(a.norm() * b.norm())
+                return float(a @ b) / d if d > 0 else 0.0
+            loss_dict["grad_x_fd"] = _norm(g_fd)
+            loss_dict["grad_x_p"] = _norm(g_p)
+            if is_vlm:
+                # Keep the historical key for plotting compatibility while
+                # publishing an unambiguous name for new VLM runs.
+                loss_dict["grad_x_vlm"] = loss_dict["grad_x_p"]
+            loss_dict["cos_update_fd_p"] = _cos(g_fd, g_p)
+            if probe is not None:
+                # held-out eval judge on this training batch — the honest
+                # conditioning meter; the in-loss classifiers' logp is not
+                loss_dict.update(probe.stats(sampled, y))
+
+        loss.backward(create_graph=False)
+
+        if torch.distributed.is_initialized():
+            for p in model_wo_ddp.parameters():
+                if p.grad is not None:
+                    torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
+
+        for i, judge in enumerate(judges):
+            judge["queue"].enqueue(all_new_feats[i].detach())
+
+        return loss, loss_dict
+
+    if args.compile:
+        from utils.runtime_util import _warmup
+        logger.info("[Compilation] Compiling fd_train_step ...")
+        t0 = time.perf_counter()
+        fd_train_step = torch.compile(fd_train_step)
+        # warm up with a 0-dim tensor scalar so the compiled graph matches the
+        # training loop's call signature (the value varies at runtime, no recompile)
+        _zero = torch.zeros((), device="cuda")
+        _warmup(lambda: fd_train_step(_zero), n=2)
+        logger.info(f"[Compilation] fd_train_step compiled in {time.perf_counter() - t0:.2f}s")
+
+    return fd_train_step
+
+
+# ---------------------------------------------------------------------------
+# Main training loop
+# ---------------------------------------------------------------------------
+
+def train_and_evaluate(args):
+    wandb_logger = setup(args)
+    register_preempt_handler()
+
+    # -- models, optimizer, checkpoint --
+    tokenizer = create_tokenizer(args)
+    model, ema_model = create_generation_model(args)
+    optimizer = create_optimizer(args, model, print_trainable_params=True)
+    model_wo_ddp = model
+
+    extra = ckpt_resume(args, model_wo_ddp, optimizer, ema_model,
+                        extra_keys=["fd_queue_states"])
+
+    rng = RNGStateManager()
+    rng.save()
+    if (not args.disable_vis) or args.vis_only:
+        visualize(args, model_wo_ddp, ema_model, args.current_step, rng=rng, tokenizer=tokenizer)
+        if args.vis_only:
+            return 0
+
+    # -- frechet distance evaluator --
+    repr_model_eval, feat_dim_eval, _, _ = load_repr_model("inception")
+    fid_evaluator = FDEvaluator(repr_model_eval, feat_dim_eval, args.fid_stats_path)
+
+    # -- frechet distance system: repr models, queues --
+    resolve_per_model_args(args)
+
+    judges = []
+    for name, stats_path, weight, pool_type, ts in zip(
+        args.fd_repr_models, args.fd_repr_stats_paths,
+        args.fd_repr_weights, args.fd_repr_pool_types, args.fd_target_sizes,
+    ):
+        repr_model, feat_dim, _, _ = load_repr_model(name, target_size=ts)
+        mu_ref, sigma_ref = load_mu_and_sigma_reference(stats_path, pool_type=pool_type)
+        queue = FeatureQueue(size=args.queue_size, feat_dim=feat_dim,
+                             online_accum=args.fd_online_accum,
+                             ema_beta=args.fd_ema_beta).cuda()
+        short = model_short_name(name)
+        sigma_ref_sqrt = None
+        if args.fd_eigvalsh:
+            sigma_ref_sqrt = precompute_sigma_ref_sqrt(sigma_ref)
+        judges.append({
+            "name": short, "model": repr_model,
+            "feat_dim": feat_dim,
+            "pool_type": pool_type,
+            "mu_ref": mu_ref, "sigma_ref": sigma_ref,
+            "sigma_ref_sqrt": sigma_ref_sqrt,
+            "queue": queue, "weight": weight,
+        })
+        eig_mode = "eigvalsh" if args.fd_eigvalsh else "eigvals"
+        stats_mode = f"ema(beta={args.fd_ema_beta})" if args.fd_ema_beta > 0 else ("online_accum" if args.fd_online_accum else "snapshot")
+        logger.info(f"[FD] Repr '{short}' ({name}): feat_dim={feat_dim}, "
+                     f"weight={weight}, pool={pool_type}, stats={stats_path}, "
+                     f"eig_mode={eig_mode}, stats_mode={stats_mode}")
+
+    fd_restored = (extra is not None
+                   and "fd_queue_states" in extra
+                   and load_fd_queue_states(judges, extra["fd_queue_states"]))
+    if fd_restored:
+        logger.info("[FD] Restored all queue states from checkpoint — skipping queue fill")
+        run_sanity_check(judges, args.queue_size, args=args)
+    else:
+        logger.info(f"[FD] Filling {len(judges)} feature queue(s) "
+                    f"({args.queue_size} entries each) ...")
+        fill_all_queues(judges, model_wo_ddp, args, tokenizer=tokenizer)
+        run_sanity_check(judges, args.queue_size, args=args)
+
+    del extra
+    torch.distributed.barrier()
+
+    model.train()
+    args.input_channels = model_wo_ddp.in_channels
+    args.input_size = model_wo_ddp.input_size
+
+    # -- conditional correction (zero-shot / supervised p(c|x)) --
+    clip_classifier = None
+    probe = None
+    if args.lambda_cond > 0:
+        if args.cond_classifiers:
+            clip_classifier = ClassifierEnsemble(
+                args.cond_classifiers,
+                num_classes=args.num_classes,
+                device="cuda",
+                dtype=args.clip_dtype,
+                default_cap=args.cond_target_logp,
+                combine=args.cond_combine,
+                members_per_step=args.cond_members_per_step,
+                clip_kwargs=dict(
+                    single_template=args.clip_single_template,
+                    cache_dir=args.clip_cache_dir,
+                    classnames_file=args.clip_classnames_file,
+                ),
+            )
+        else:
+            clip_classifier = CLIPClassifier(
+                model_name=args.clip_model_name,
+                pretrained=args.clip_pretrained,
+                dtype=args.clip_dtype,
+                single_template=args.clip_single_template,
+                cache_dir=args.clip_cache_dir,
+                classnames_file=args.clip_classnames_file,
+                num_classes=args.num_classes,
+                device="cuda",
+                logit_scale_override=args.clip_logit_scale,
+            )
+        smoke = clip_classifier.smoke_test_uniform(image_size=args.input_size)
+        logger.info(f"[CLIPClassifier] smoke (noise images): mean log p/class="
+                    f"{smoke['mean_logp_per_class']:.3f} "
+                    f"(uniform ref {smoke['uniform_ref']:.3f})")
+        logger.info(f"[CLIPClassifier] L_cond enabled, lambda_cond={args.lambda_cond} "
+                    f"| warmup={args.cond_warmup_steps} ramp={args.cond_ramp_steps} "
+                    f"| eot_views={args.clip_eot_views} noise={args.clip_eot_noise_std} "
+                    f"crop_min={args.clip_eot_crop_min} "
+                    f"| target_logp={args.cond_target_logp} "
+                    f"logit_scale={args.clip_logit_scale or 'native'}")
+    else:
+        logger.info("[CLIPClassifier] lambda_cond=0 -> conditional correction disabled")
+
+    if args.cond_probe and args.lambda_cond > 0:
+        probe = ProbeClassifier(device="cuda")
+        logger.info("[Probe] held-out resnet50 IMAGENET1K_V2 (the "
+                    "eval_class_accuracy.py judge) logged as probe_top1/top5/"
+                    "logp at diag steps — never in the loss")
+
+    # -- FD train step closure --
+    sampling_args = {
+        "t_min": args.interval_min,
+        "t_max": args.interval_max,
+        "cfg": args.cfg,
+        "num_steps": args.num_sampling_steps,
+    }
+
+    if clip_classifier is not None and args.clip_grad_check:
+        assert_clip_grad_flows(clip_classifier, model_wo_ddp, args,
+                               sampling_args, tokenizer=tokenizer)
+
+    fd_train_step = get_fd_train_step(
+        model_wo_ddp, judges, sampling_args, args, tokenizer=tokenizer,
+        clip_classifier=clip_classifier, probe=probe,
+    )
+
+    # -- training loop --
+    logger.info(f"training from step {args.current_step:,} -> {args.total_steps:,} "
+                f"({args.start_epoch} -> {args.epochs} epochs)")
+
+    global_bsz = args.batch_size * args.world_size
+    ckpt_saver = AsyncCheckpointSaver()
+    session_start = time.time()
+    step_start = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # dynamic checkpoint frequency: target ~10 min between saves
+    ckpt_target_minutes = 10.0
+    ckpt_measure_interval = 1000
+    ckpt_timer_start = time.perf_counter()
+    ckpt_timer_step = args.current_step
+    last_ckpt_step = args.current_step
+
+    # metric logger
+    metric_file = os.path.join(args.log_dir, "training_metrics.json")
+    metric_logger = MetricLogger(delimiter="  ", output_file=metric_file, prefetch=True)
+    for name, window, fmt in [
+        ("lr",               1,               "{value:.6f}"),
+        ("samples/s/device", args.print_freq, "{avg:.2f}"),
+        ("samples/s",        args.print_freq, "{avg:.2f}"),
+        ("samples_seen(M)",  args.print_freq, "{value:.2f}"),
+        ("device_mem(GB)",   args.print_freq, "{value:.2f}"),
+    ]:
+        metric_logger.add_meter(name, SmoothedValue(window, fmt))
+
+    def _infinite():
+        while True:
+            yield None
+
+    for step, _ in metric_logger.log_every(
+        _infinite(), args.print_freq, header="Train:",
+        start_iteration=args.current_step, n_iterations=args.total_steps,
+    ):
+        model.train()
+        adjust_learning_rate(optimizer, step, args)
+
+        lambda_eff = cond_lambda_schedule(step, args) if clip_classifier is not None else 0.0
+        # pass scalar as a 0-dim tensor so the compiled step does not recompile
+        # as the warmup/ramp changes its value
+        lambda_t = torch.as_tensor(lambda_eff, device="cuda", dtype=torch.float32)
+        # per-term grad diagnostics cost extra partial backwards through the
+        # frozen judges — only on log-steps, and not under torch.compile.
+        diag = (not args.compile) and (step % args.print_freq == 0)
+        loss, loss_dict = fd_train_step(lambda_cond_eff=lambda_t, diag=diag)
+
+        if clip_classifier is not None:
+            loss_dict["lambda_eff"] = lambda_eff
+
+        grad_norm = (torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                     if args.grad_clip > 0.0 else get_grad_norm(model.parameters()))
+
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+            ema_model.step(model)
+        else:
+            logger.warning(f"[step {step}] NaN/Inf grad_norm — skipping optimizer & EMA update")
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+
+        args.current_step = step + 1
+        args.samples_seen += global_bsz
+
+        # timing & metrics
+        step_time = time.perf_counter() - step_start
+        step_start = time.perf_counter()
+
+        loss_value = all_reduce_mean(loss.item())
+        loss_dict = {k: all_reduce_mean(v) for k, v in loss_dict.items()}
+        sps = args.batch_size / step_time if step_time > 0 else 0.0
+        mem_gb = torch.cuda.max_memory_reserved() / (1024 ** 3) if torch.cuda.is_available() else 0.0
+
+        metric_logger.update(
+            loss=loss_value, grad_norm=grad_norm,
+            lr=optimizer.param_groups[0]["lr"],
+            **{"samples/s/device": sps, "samples/s": sps * args.world_size,
+               "samples_seen(M)": args.samples_seen / 1e6, "device_mem(GB)": mem_gb},
+            **loss_dict,
+        )
+
+        # wandb
+        if step % args.print_freq == 0 and wandb_logger:
+            elapsed = time.time() - session_start + args.last_elapsed_time
+            remaining = args.total_steps - args.current_step
+            eta = elapsed / args.current_step * remaining if args.current_step > 0 else 0.0
+            elapsed_h = elapsed / 3600
+            wandb_logger.update({
+                "train/loss": loss_value,
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/grad_norm": grad_norm,
+                "train/samples_seen_M": args.samples_seen / 1e6,
+                "perf/samples_per_sec_per_device": sps,
+                "perf/samples_per_sec": sps * args.world_size,
+                "perf/max_reserved_mem_gb": mem_gb,
+                "perf/elapsed_real_hours": elapsed_h,
+                "perf/elapsed_device_hours": elapsed_h * args.world_size,
+                "perf/eta_real_hours": eta / 3600,
+                "perf/eta_device_hours": eta / 3600 * args.world_size,
+                **{f"train/{k}": v for k, v in loss_dict.items()},
+            }, step=args.current_step)
+
+        # dynamic checkpoint frequency
+        steps_since_timer = args.current_step - ckpt_timer_step
+        if steps_since_timer >= ckpt_measure_interval:
+            elapsed_minutes = (time.perf_counter() - ckpt_timer_start) / 60.0
+            minutes_per_step = elapsed_minutes / steps_since_timer
+            new_save_every = max(100, round(ckpt_target_minutes / minutes_per_step / 100) * 100)
+            if new_save_every != args.save_every:
+                logger.info(f"adjusting save_every: {args.save_every} -> {new_save_every} "
+                            f"({minutes_per_step * 1000:.1f} min/1k steps)")
+                args.save_every = new_save_every
+            ckpt_timer_start = time.perf_counter()
+            ckpt_timer_step = args.current_step
+
+        # checkpoint
+        def _save(saver=ckpt_saver):
+            elapsed = time.time() - session_start + args.last_elapsed_time
+            fd_extra = {"fd_queue_states": save_fd_queue_states(judges)} if judges else {}
+            save_checkpoint(args, step, model_wo_ddp, optimizer, ema_model, elapsed,
+                            saver=saver, extra=fd_extra)
+            torch.distributed.barrier()
+
+        if (args.current_step - last_ckpt_step >= args.save_every
+                or args.current_step == args.total_steps):
+            _save()
+            last_ckpt_step = args.current_step
+
+        if args.milestone_every > 0 and step > 0 and step % args.milestone_every == 0:
+            _save()
+
+        # slurm preemption
+        if preempt_requested():
+            logger.info(f"Preemption at step {args.current_step}: saving checkpoint ...")
+            ckpt_saver.wait()
+            _save(saver=None)
+            logger.info(f"Preemption checkpoint saved at step {args.current_step}. Exiting.")
+            return 0
+
+        # visualization
+        if args.vis_every > 0 and args.current_step % args.vis_every == 0:
+            visualize(args, model_wo_ddp, ema_model, args.current_step, rng=rng, tokenizer=tokenizer)
+            model_wo_ddp.train()
+
+        # online evaluation
+        if args.eval_every > 0 and args.online_eval and args.current_step % args.eval_every == 0:
+            torch.cuda.empty_cache()
+            evaluate_all_emas(
+                args, model_wo_ddp, ema_model, fid_evaluator, tokenizer,
+                step=args.current_step, wandb_logger=wandb_logger,
+                cfg=args.cfg, num_images=args.num_images_for_eval_and_search,
+            )
+            model_wo_ddp.train()
+
+    # -- final --
+    ckpt_saver.wait()
+    total = time.time() - session_start + args.last_elapsed_time
+    metric_logger.synchronize_between_processes()
+    logger.info(f"averaged stats: {metric_logger}")
+    logger.info(f"Training complete. Total time: {datetime.timedelta(seconds=int(total))} "
+                f"on {args.world_size} devices")
+    torch.cuda.empty_cache()
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def get_args_parser():
+    parser = argparse.ArgumentParser("FD loss fine-tuning for generation models", add_help=False)
+
+    # training
+    parser.add_argument("--start_epoch", default=0, type=int)
+    parser.add_argument("--epochs", default=200, type=int)
+    parser.add_argument("--steps_per_epoch", default=1250, type=int)
+    parser.add_argument("--batch_size", default=32, type=int, help="batch size per GPU")
+    parser.add_argument("--noise_scale", type=float, default=1.0)
+    parser.add_argument("--same_noise", action="store_true")
+
+    # model architecture
+    parser.add_argument("--model", default="pMF_B", type=str)
+    parser.add_argument("--img_size", default=256, type=int)
+    parser.add_argument("--patch_size", default=16, type=int)
+    parser.add_argument("--label_drop_prob", default=0.1, type=float)
+    parser.add_argument("--attn_dropout", type=float, default=0.0)
+    parser.add_argument("--proj_dropout", type=float, default=0.0)
+    parser.add_argument("--class_tokens", type=int, default=8)
+    parser.add_argument("--time_tokens", type=int, default=4)
+    parser.add_argument("--guidance_tokens", type=int, default=4)
+    parser.add_argument("--interval_tokens", type=int, default=2)
+    parser.add_argument("--norm_eps", type=float, default=0.01)
+    parser.add_argument("--norm_p", type=float, default=1.0)
+    parser.add_argument("--rope_2d", action="store_true")
+    parser.add_argument("--learned_pe", action="store_true")
+    parser.add_argument("--disable_v_head", action="store_true")
+    parser.add_argument("--t_eps", type=float, default=5e-2)
+
+    # rectified-flow (NCSN++) base model
+    parser.add_argument("--rf_dropout", type=float, default=0.0,
+                        help="dropout in the NCSN++ backbone during FD sampling "
+                             "(0.0 = deterministic forward; the pretrained weights "
+                             "are dropout-rate agnostic)")
+    parser.add_argument("--rf_grad_checkpoint", action="store_true", default=True,
+                        help="gradient-checkpoint each Euler ODE step so backprop "
+                             "memory is ~O(1) in num_sampling_steps")
+    parser.add_argument("--no_rf_grad_checkpoint", action="store_false",
+                        dest="rf_grad_checkpoint")
+
+    # tokenizer
+    parser.add_argument("--tokenizer", default=None, type=str)
+    parser.add_argument("--token_channels", default=3, type=int)
+    parser.add_argument("--tokenizer_patch_size", default=1, type=int)
+
+    # optimization
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--min_lr", type=float, default=1e-6)
+    parser.add_argument("--lr_sched", type=str, default="constant", choices=["constant", "cosine"])
+    parser.add_argument("--warmup_rate", type=float, default=0.0)
+    parser.add_argument("--warmup_epochs", type=int, default=-1)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--grad_clip", type=float, default=0.0, help="gradient clip, 0.0 means no clip")
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.95)
+    parser.add_argument("--use_muon", action="store_true")
+    parser.add_argument("--muon_lr", type=float, default=1e-3)
+    parser.add_argument("--muon_momentum", type=float, default=0.95)
+    parser.add_argument("--muon_weight_decay", type=float, default=0.0)
+    parser.add_argument("--ema_type", default="edm", type=str, choices=["const", "edm"])
+    parser.add_argument("--ema_rates", default=[0.9999, 0.9996], type=float, nargs="+")
+    parser.add_argument("--ema_halflife_kimg", default=[250, 500, 1000, 2000], type=float, nargs="+")
+    parser.add_argument("--eval_ema_labels", default=None, type=str, nargs="+")
+
+    parser.add_argument("--grad_checkpointing", action="store_true")
+
+    # diffusion / flow-matching
+    parser.add_argument("--P_mean", type=float, default=0.8)
+    parser.add_argument("--P_std", type=float, default=0.8)
+    parser.add_argument("--legacy_time_convention", action="store_true")
+    parser.add_argument("--tr_uniform", action="store_true")
+    parser.add_argument("--ratio_r_neq_t", type=float, default=0.5)
+    parser.add_argument("--cfg_beta", type=float, default=1.0)
+    parser.add_argument("--cfg_omega_max", type=float, default=7.0)
+    parser.add_argument("--aux_head_depth", type=int, default=8)
+    parser.add_argument("--loss_type", type=str, default="v", choices=["v", "x"])
+    parser.add_argument("--aux_pred_type", type=str, default="v", choices=["v", "x"])
+    parser.add_argument("--perceptual_threshold", type=float, default=0.8)
+    parser.add_argument("--perceptual_loss_on_aux", action="store_true")
+
+    # sampling & generation
+    parser.add_argument("--sampling_method", type=str, default="heun", choices=["euler", "heun"])
+    parser.add_argument("--num_sampling_steps", type=int, default=50)
+    parser.add_argument("--cfg", default=4.0, type=float)
+    parser.add_argument("--cfg_list", type=float, nargs="+",
+                        default=[2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.5, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0])
+    parser.add_argument("--interval_min", type=float, default=0.1)
+    parser.add_argument("--interval_max", type=float, default=1.0)
+    parser.add_argument("--vis_steps", default=[1], type=int, nargs="+")
+
+    # data
+    parser.add_argument("--data_path", default="./data/imagenet/train", type=str)
+    parser.add_argument("--num_classes", default=1000, type=int)
+    parser.add_argument("--class_of_interest", default=[207, 360, 387, 974, 88, 979, 417, 279],
+                        type=int, nargs="+")
+    parser.add_argument("--force_class_of_interest", action="store_true")
+    parser.add_argument("--num_workers", default=10, type=int)
+    parser.add_argument("--pin_mem", action="store_true")
+    parser.add_argument("--no_pin_mem", action="store_false", dest="pin_mem")
+    parser.set_defaults(pin_mem=True)
+
+    # checkpointing
+    parser.add_argument("--auto_resume", action="store_true")
+    parser.add_argument("--resume_from", default=None)
+    parser.add_argument("--load_from", type=str, default=None)
+    parser.add_argument("--keep_n_ckpts", default=3, type=int)
+    parser.add_argument("--milestone_interval", default=20, type=int)
+
+    # evaluation
+    parser.add_argument("--online_eval", action="store_true")
+    parser.add_argument("--num_images_for_eval_and_search", default=10000, type=int)
+    parser.add_argument("--num_images", default=50000, type=int)
+    parser.add_argument("--eval_bsz", type=int, default=64)
+    parser.add_argument("--fid_stats_path", type=str, default="data/fid_stats/guided_diffusion_stats.npz")
+    parser.add_argument("--keep_eval_folder", action="store_true")
+
+    parser.add_argument("--save_eval_images", action="store_true")
+    parser.add_argument("--cfg_min", default=1.0, type=float)
+    parser.add_argument("--cfg_max", default=25.0, type=float)
+    parser.add_argument("--overwrite_cache", action="store_true")
+
+    # FD fine-tuning
+    parser.add_argument("--queue_size", type=int, default=50000)
+    parser.add_argument("--fd_fid_norm_eps", type=float, default=0.01)
+    parser.add_argument("--fd_queue_fill_bsz", type=int, default=256)
+    parser.add_argument("--fd_repr_models", type=str, nargs="+", default=["inception"],
+                        help="feature extractors: 'inception' or timm model names")
+    parser.add_argument("--fd_repr_stats_paths", type=str, nargs="+", default=None,
+                        help="reference stats (.npz) per repr model; auto-inferred if omitted")
+    parser.add_argument("--fd_repr_weights", type=float, nargs="+", default=None,
+                        help="per-model FID loss weight (default 1.0 each)")
+    parser.add_argument("--fd_repr_pool_types", type=str, nargs="+", default=None,
+                        help="pool type per repr model: 'cls' or 'avg' (default 'cls')")
+    parser.add_argument("--fd_target_sizes", type=int, nargs="+", default=None,
+                        help="per-model target resolution override (default: model's native size)")
+    parser.add_argument("--fd_online_accum", action="store_true",
+                        help="use online accumulators for FD (avoids cloning 50k queue each step)")
+    parser.add_argument("--fd_eigvalsh", action="store_true",
+                        help="use eigvalsh on symmetric product instead of eigvals (~8x faster, exact)")
+    parser.add_argument("--fd_ema_beta", type=float, default=0.0, metavar="BETA",
+                        help="EMA decay for FD stats (0=disabled, use queue). "
+                             "Implies online_accum. E.g. 0.999 → ~1000-batch window")
+
+    # conditional correction (CLIP zero-shot p(c|x)) — additive to FD-loss
+    parser.add_argument("--lambda_cond", type=float, default=0.1,
+                        help="weight on the conditional correction L_cond = "
+                             "-E[log p(c|x)]. 0 disables it. DEFAULT 0.1 NEEDS TUNING.")
+    parser.add_argument("--clip_model_name", type=str, default="ViT-L-14",
+                        help="open_clip arch for the zero-shot classifier "
+                             "(ViT-L-14 best signal; ViT-B-32 cheaper)")
+    parser.add_argument("--clip_pretrained", type=str, default="openai",
+                        help="open_clip pretrained tag")
+    parser.add_argument("--clip_dtype", type=str, default="bf16",
+                        choices=["bf16", "fp16", "fp32"],
+                        help="CLIP compute/param dtype (bf16 to save memory)")
+    parser.add_argument("--clip_single_template", action="store_true",
+                        help="use 'a photo of a {c}.' instead of the 80-prompt "
+                             "OpenAI ensemble (faster startup, ~1.5%% lower acc)")
+    parser.add_argument("--clip_cache_dir", type=str, default="data/clip_text_cache",
+                        help="dir for the cached (num_classes, d) text embeddings")
+    parser.add_argument("--clip_classnames_file", type=str, default=None,
+                        help="optional newline-separated class-name override")
+    parser.add_argument("--clip_grad_check", action="store_true",
+                        help="at startup, assert L_cond gradients reach the generator")
+
+    # -- anti-adversarial guards for the one-sided L_cond --
+    parser.add_argument("--cond_warmup_steps", type=int, default=0,
+                        help="steps with lambda_cond=0 before the CLIP term turns "
+                             "on (let FD sharpen real images first). 0 = on from step 0")
+    parser.add_argument("--cond_ramp_steps", type=int, default=0,
+                        help="linear ramp length (steps) for lambda_cond after "
+                             "warmup. 0 = step on at full strength")
+    parser.add_argument("--cond_target_logp", type=float, default=0.0,
+                        help="cap per-sample log p(c|x) at this value (<0); once a "
+                             "sample is this confident it stops contributing grad, "
+                             "preventing the race to ~100%% adversarial confidence. "
+                             "0 disables the cap. e.g. -0.69 ~= cap at 50%%")
+    parser.add_argument("--clip_logit_scale", type=float, default=0.0,
+                        help="override CLIP's logit scale (temperature). 0 = native "
+                             "(~99, razor-sharp). Smaller (e.g. 30) flattens the "
+                             "softmax -> weaker, less exploitable gradient")
+    parser.add_argument("--clip_eot_views", type=int, default=1,
+                        help="EOT: average log p(c|x) over this many augmented "
+                             "views. 1 = no averaging. >1 multiplies CLIP cost")
+    parser.add_argument("--clip_eot_noise_std", type=float, default=0.0,
+                        help="EOT: additive Gaussian noise std per view ([0,1] space)")
+    parser.add_argument("--clip_eot_crop_min", type=float, default=1.0,
+                        help="EOT: min random-resized-crop scale per view (1.0 = off)")
+
+    # -- multi-classifier ensemble for log p(c|x) (classifier_ensemble.py) --
+    parser.add_argument("--cond_classifiers", type=str, default="",
+                        help="comma-separated ensemble spec 'kind:name[:k=v]*', kind in "
+                             "{clip,timm}, options w/cap/T (+ scale/pre for clip). Empty "
+                             "= single CLIP via --clip_model_name (legacy path). E.g. "
+                             "'clip:ViT-L-14:cap=-0.69,"
+                             "timm:convnext_base.fb_in22k_ft_in1k:cap=-0.69,"
+                             "timm:deit3_base_patch16_224.fb_in22k_ft_in1k:cap=-0.69'")
+    parser.add_argument("--cond_combine", type=str, default="mean",
+                        choices=["mean", "min"],
+                        help="mean: weighted mean of per-member capped log p (product "
+                             "of experts). min: all gradient to the weakest member")
+    parser.add_argument("--cond_members_per_step", type=int, default=0,
+                        help="round-robin K members per step (0 = all every step). "
+                             "K>=2 keeps a cross-paradigm consensus per step at "
+                             "reduced cost")
+
+    # -- single differentiable VLM critic (paper-style binary Yes/No loss) --
+    parser.add_argument("--cond_vlm_model", type=str, default="",
+                        help="Hugging Face VLM model id or local checkpoint path. When "
+                             "set, replaces --cond_classifiers/the legacy CLIP scorer "
+                             "with one frozen differentiable Yes/No VLM critic. This is "
+                             "a PyTorch VLM, not the vLLM inference server.")
+    parser.add_argument("--vlm_dtype", type=str, default="bf16",
+                        choices=["bf16", "fp16", "fp32"],
+                        help="frozen VLM parameter/compute dtype")
+    parser.add_argument("--vlm_microbatch", type=int, default=1,
+                        help="images per VLM forward. Detached-image VJPs are computed "
+                             "per microbatch and injected into the generator graph, so "
+                             "VLM activations can be released immediately")
+    parser.add_argument("--vlm_samples_per_step", type=int, default=4,
+                        help="uniformly sampled local generated images scored by the VLM "
+                             "per optimizer step (0 = all local images)")
+    parser.add_argument("--vlm_question_mode", type=str, default="pairwise",
+                        choices=["target", "pairwise"],
+                        help="target: ask whether the image has the requested class "
+                             "(answer Yes). pairwise: contrast target with a random "
+                             "distractor and randomly swap order, balancing Yes/No")
+    parser.add_argument("--vlm_prompt_template", type=str, default=None,
+                        help="optional target-mode question template containing "
+                             "'{class_name}'; the model chat template and image token "
+                             "are added automatically")
+    parser.add_argument("--vlm_pairwise_prompt_template", type=str, default=None,
+                        help="optional pairwise question template containing "
+                             "'{first_class}' and '{second_class}'")
+    parser.add_argument("--vlm_attn_implementation", type=str, default="sdpa",
+                        choices=["sdpa", "eager", "flash_attention_2"],
+                        help="Transformers attention backend; sdpa needs no extra package")
+    parser.add_argument("--vlm_gradient_checkpointing", action="store_true",
+                        help="checkpoint frozen VLM activations during each image VJP "
+                             "(slower; useful if even microbatch 1 is memory-limited)")
+    parser.add_argument("--vlm_local_files_only", action="store_true",
+                        help="never download VLM files; require a complete local cache/path")
+    parser.add_argument("--vlm_skip_smoke", action="store_true",
+                        help="skip the startup VLM image-gradient plumbing check")
+    parser.add_argument("--cond_probe", action="store_true",
+                        help="log held-out torchvision resnet50 V2 top-1/top-5/logp on "
+                             "the training batch at diag steps (the same weights "
+                             "eval_class_accuracy.py judges with; never in the loss)")
+
+    # logging & tracking
+    parser.add_argument("--output_dir", default="./work_dirs")
+    parser.add_argument("--local_eval_dir", type=str, default=None)
+    parser.add_argument("--print_freq", type=int, default=50)
+    parser.add_argument("--eval_freq", type=int, default=10)
+    parser.add_argument("--vis_freq", type=int, default=10)
+    parser.add_argument("--val_freq", type=int, default=10)
+    parser.add_argument("--save_freq", type=int, default=5)
+    parser.add_argument("--vis_only", action="store_true")
+    parser.add_argument("--disable_vis", action="store_true")
+    parser.add_argument("--last_elapsed_time", type=float, default=0.0)
+    parser.add_argument("--current_step", type=int, default=0)
+    parser.add_argument("--samples_seen", type=int, default=0)
+    parser.add_argument("--project", default="One3", type=str)
+    parser.add_argument("--entity", default=None, type=str)
+    parser.add_argument("--exp_name", default=None, type=str)
+    parser.add_argument("--enable_wandb", action="store_true")
+    parser.add_argument("--disable_wandb", action="store_false", dest="enable_wandb")
+
+
+    # new added plotting
+    parser.add_argument("--dist_vis_every", type=int, default=500,
+                        help="steps between distribution analysis plots (0 = disabled)")
+    parser.add_argument("--dist_vis_n", type=int, default=5000,
+                        help="features to subsample per judge for vis (default 5000)")
+    parser.add_argument("--real_features_paths", type=str, nargs="+", default=None,
+                            help="One or more cached real .npy paths, auto-matched to "
+                                "judges by feat_dim. Use this when training with multiple "
+                                "judges (FD-SIM). Example: "
+                                "--real_features_paths "
+                                "work_dirs/real_features/inception_ADM/real.npy "
+                                "work_dirs/real_features/mae/real.npy "
+                                "work_dirs/real_features/siglip/real.npy")
+
+
+    # system
+    parser.add_argument("--seed", default=1, type=int)
+    parser.add_argument("--dtype", default="bf16", type=str, choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--compile", action="store_true")
+
+    return parser
+
+
+if __name__ == "__main__":
+    args = get_args_parser().parse_args()
+    sys.exit(train_and_evaluate(args))

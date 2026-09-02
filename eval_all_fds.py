@@ -179,16 +179,18 @@ def accumulate_batch(images, repr_models, accumulators, inception_logits,
             inception_logits.append(logits.cpu())
             break
 
-
 def _reduce_and_compute(repr_models, accumulators, inception_logits,
                         inception_idx, local_feat_lists, *,
                         prc_ref_features=None, prc_model_names=None,
                         mmd_ref_features=None, mmd_model_names=None,
-                        prc_k=3, prc_batch_size=5000):
+                        prc_k=3, prc_batch_size=5000,
+                        save_feat_names=None, save_features_dir=None):
     """Reduce across ranks, compute FD / IS / P&R / CMMD.
 
     ``local_feat_lists`` collects per-sample features for the union of
-    P&R and CMMD models.  Each metric uses its own reference features.
+    P&R, CMMD, and save-features models.  Each metric uses its own
+    reference features; save-features just dumps the gathered tensor to
+    .npy on rank 0.
     """
     world_size, rank = get_world_size(), get_global_rank()
     device = torch.device("cuda")
@@ -197,7 +199,8 @@ def _reduce_and_compute(repr_models, accumulators, inception_logits,
     prc_model_names = set(prc_model_names or [])
     mmd_ref_features = mmd_ref_features or {}
     mmd_model_names = set(mmd_model_names or [])
-    feat_model_names = prc_model_names | mmd_model_names
+    save_feat_names = set(save_feat_names or [])
+    feat_model_names = prc_model_names | mmd_model_names | save_feat_names
 
     # Reduce each unique accumulator once, then compute FD per entry
     reduced = {}  # id(acc) -> (mu, sigma) or None (non-rank-0)
@@ -246,7 +249,7 @@ def _reduce_and_compute(repr_models, accumulators, inception_logits,
         else:
             is_val, _ = np_isc(local_logits.cpu())
 
-    # Per-sample metrics (P&R, CMMD) — require gathered features + reference.
+    # Per-sample metrics (P&R, CMMD) and optional feature dump.
     # NOTE: feat_model_names is the same on all ranks; ref dicts are only
     # populated on rank 0.  Guard on feat_model_names (not ref dicts) to
     # ensure all ranks participate in the collective gather/broadcast.
@@ -262,6 +265,14 @@ def _reduce_and_compute(repr_models, accumulators, inception_logits,
 
         do_prc = feat_name in prc_model_names
         do_mmd = feat_name in mmd_model_names
+        do_save = feat_name in save_feat_names
+
+        if rank == 0 and do_save and save_features_dir:
+            os.makedirs(save_features_dir, exist_ok=True)
+            out_path = os.path.join(save_features_dir, f"{feat_name}.npy")
+            np.save(out_path, all_gen.float().cpu().numpy())
+            logger.info(f"Saved features '{feat_name}' "
+                        f"{tuple(all_gen.shape)} -> {out_path}")
 
         if rank == 0:
             gen_gpu = all_gen.float()
@@ -306,7 +317,6 @@ def _reduce_and_compute(repr_models, accumulators, inception_logits,
 
     return results, is_val, prc_results, mmd_results
 
-
 # ---------------------------------------------------------------------------
 # Image sources: generate or load from folder
 # ---------------------------------------------------------------------------
@@ -324,7 +334,15 @@ def _generate_and_evaluate(args, model, ema_model, repr_models, cfg, ema_label,
     device = torch.device("cuda")
     prc_model_names = prc_model_names or []
     mmd_model_names = mmd_model_names or []
-    feat_model_names = sorted(set(prc_model_names) | set(mmd_model_names))
+    # feat_model_names = sorted(set(prc_model_names) | set(mmd_model_names))
+    
+    save_set = set()
+    if getattr(args, "save_features", None):
+        all_names = [r["name"] for r in repr_models]
+        save_set = set(all_names) if "all" in args.save_features else set(args.save_features)
+
+    feat_model_names = sorted(set(prc_model_names) | set(mmd_model_names) | save_set)
+    local_feat_lists = {n: [] for n in feat_model_names}
 
     start_idx, end_idx = get_start_end_indices(num_images, world_size, rank)
     local_n = end_idx - start_idx
@@ -371,14 +389,23 @@ def _generate_and_evaluate(args, model, ema_model, repr_models, cfg, ema_label,
     gen_time = time.perf_counter() - t0
     torch.cuda.empty_cache()
 
+    # results, is_val, prc_results, mmd_results = _reduce_and_compute(
+    #     repr_models, accumulators, inception_logits, inception_idx,
+    #     local_feat_lists,
+    #     prc_ref_features=prc_ref_features, prc_model_names=prc_model_names,
+    #     mmd_ref_features=mmd_ref_features, mmd_model_names=mmd_model_names,
+    #     prc_k=args.prc_k, prc_batch_size=args.prc_batch_size,
+    # )
     results, is_val, prc_results, mmd_results = _reduce_and_compute(
         repr_models, accumulators, inception_logits, inception_idx,
         local_feat_lists,
         prc_ref_features=prc_ref_features, prc_model_names=prc_model_names,
         mmd_ref_features=mmd_ref_features, mmd_model_names=mmd_model_names,
         prc_k=args.prc_k, prc_batch_size=args.prc_batch_size,
+        save_feat_names=save_set,
+        save_features_dir=os.path.join(args.log_dir, "features",
+                                    f"ema={ema_label}-cfg={cfg}"),
     )
-
     # Cleanup eval images
     if save_images and eval_dir and not getattr(args, "keep_eval_folder", False):
         for idx in range(start_idx, end_idx):
@@ -1160,6 +1187,10 @@ def _get_folder_parser():
     parser.add_argument("--prc_batch_size", type=int, default=10000)
     parser.add_argument("--output_csv", type=str, nargs="+", default=None,
                         help="One or more output CSV paths (must match --image_folder count)")
+    parser.add_argument("--save_features", type=str, nargs="*", default=None,
+    help="Names of repr models whose per-sample features to dump as .npy "
+         "(e.g. 'FID(ADM) dinov2_cls'), or 'all'.")
+    
     return parser
 
 
@@ -1192,6 +1223,8 @@ def get_args_parser():
     parser.add_argument("--prc_batch_size", type=int, default=10000)
     parser.add_argument("--enable_vis", action="store_false", dest="disable_vis",
                         help="generate visualization grids before evaluation")
+    parser.add_argument("--save_features", type=str, nargs="*", default=None,
+                        help="Names of repr models whose per-sample features to dump as .npy")
     parser.set_defaults(disable_vis=True)
     return parser
 

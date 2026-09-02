@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from frechet_distance.losses import (
+    all_gather_plain,
     compute_frechet_distance_loss,
     diff_all_gather,
 )
@@ -110,11 +111,25 @@ def load_fd_queue_states(judges, saved_states):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def fill_all_queues(judges, model, args, tokenizer=None):
+def fill_all_queues(judges, model, args, tokenizer=None, gmm_judge=None,
+                    feature_collector=None):
     """Fill all repr-model feature queues with generated images.
 
     EMA judges use streaming accumulation (no feature buffer allocated).
     Non-EMA judges fill the feature buffer as before.
+
+    When *gmm_judge* is given, the generated-side class statistics are seeded
+    from the same samples rather than from a second generation pass -- the fill
+    already draws ``queue_size`` labelled samples, which is exactly the budget
+    the GMM bootstrap needs.
+
+    *feature_collector*, when given, is called as
+    ``feature_collector(judge_name, all_feats, all_labels)`` for every judge on
+    every fill batch, with the globally gathered (detached) features and labels.
+    It exists so a second consumer -- e.g. the VLM-delta q replay buffer -- can
+    be seeded from the same generation pass instead of paying for its own.
+    Purely additive: with the default ``None`` nothing about this function
+    changes.
     """
     queue_size = args.queue_size
     if queue_size == 0:
@@ -122,16 +137,33 @@ def fill_all_queues(judges, model, args, tokenizer=None):
         return
 
     model.eval()
+    train_class_ids = getattr(args, "train_class_ids", None)
+    train_class_ids_tensor = (
+        None if train_class_ids is None
+        else torch.tensor(train_class_ids, dtype=torch.long, device="cuda")
+    )
+    if train_class_ids_tensor is not None:
+        logger.info(
+            "[FD] Queue fill restricted to %d training labels: %s",
+            train_class_ids_tensor.numel(), train_class_ids,
+        )
     filled = 0
     while filled < queue_size:
         batch_size = min(args.fd_queue_fill_bsz, queue_size - filled)
-        y = torch.randint(0, args.num_classes, (batch_size,), device="cuda")
+        if train_class_ids_tensor is None:
+            y = torch.randint(0, args.num_classes, (batch_size,), device="cuda")
+        else:
+            subset_indices = torch.randint(
+                0, train_class_ids_tensor.numel(), (batch_size,), device="cuda",
+            )
+            y = train_class_ids_tensor[subset_indices]
         imgs = model.generate(batch_size, y, cfg=args.cfg, args=args, verbose=False)
         if tokenizer is not None:
             imgs = tokenizer.detokenize(imgs) # [0, 1]
         else:
             imgs = imgs * 0.5 + 0.5  # [-1,1] -> [0,1]
 
+        y_all = None
         for judge in judges:
             local_feats = extract_judge_features(judge, imgs)
             all_feats = diff_all_gather(local_feats)
@@ -141,6 +173,21 @@ def fill_all_queues(judges, model, args, tokenizer=None):
                 q.accumulate_batch(all_feats[:count])
             else:
                 q.feats[filled:filled + count] = all_feats[:count].float()
+
+            if gmm_judge is not None and judge is gmm_judge:
+                if y_all is None:
+                    y_all = all_gather_plain(y)
+                reference = judge["gmm_ref"]
+                judge["gmm_online"].update(
+                    reference.project(all_feats[:count].detach()),
+                    reference.to_local(y_all[:count]),
+                )
+
+            if feature_collector is not None:
+                if y_all is None:
+                    y_all = all_gather_plain(y)
+                feature_collector(judge["name"], all_feats[:count].detach(),
+                                  y_all[:count])
 
         filled += count
         logger.info(f"[FD] Queue fill: {filled}/{queue_size} ({filled / queue_size * 100:.1f}%)")
@@ -154,6 +201,16 @@ def fill_all_queues(judges, model, args, tokenizer=None):
             if q.online_accum:
                 q._init_accumulators()
     logger.info(f"[FD] All {len(judges)} queues initialized with {filled} features")
+
+    if gmm_judge is not None:
+        online, reference = gmm_judge["gmm_online"], gmm_judge["gmm_ref"]
+        online.refresh_cache(reference)
+        stats = online.diagnostics(reference)
+        logger.info(
+            f"[GMM] Bootstrapped q from {int(online.total_seen.item())} generated "
+            f"samples (class coverage {online.coverage * 100:.1f}%): "
+            + ", ".join(f"{k}={v:.4f}" for k, v in stats.items())
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -199,6 +199,11 @@ def ckpt_resume(
                 logger.info(f"[Model-load] Converting official pMF checkpoint keys")
                 state_dict = convert_pmf_checkpoint(state_dict)
 
+            if args.model in models.RFDenoiser_models:
+                from models.denoiser_rf import convert_rf_checkpoint
+                logger.info(f"[Model-load] Converting RectifiedFlow NCSN++ checkpoint keys")
+                state_dict = convert_rf_checkpoint(state_dict)
+
             if len(state_dict) > 0:
                 msg = _load_model_sd(model, state_dict, strict=False)
                 logger.info(f"[Model-load] Loaded model: {msg}")

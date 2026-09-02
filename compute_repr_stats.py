@@ -19,7 +19,7 @@ import torch
 import torch.distributed as dist
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from tqdm import tqdm
 
 logger = logging.getLogger("FD_loss")
@@ -48,6 +48,9 @@ def parse_args():
                    help="directory to save the .npz file")
     p.add_argument("--output_name", type=str, default=None,
                    help="override output filename")
+    p.add_argument("--class_ids", type=int, nargs="+", default=None,
+                   help="optional ImageFolder class-index subset; statistics "
+                        "are computed only from these classes")
     return p.parse_args()
 
 
@@ -60,14 +63,57 @@ def setup_distributed():
     return rank, world_size
 
 
-def build_dataloader(data_path, img_size, batch_size, num_workers, rank, world_size):
+def validate_class_ids(class_ids, num_classes):
+    """Validate and normalize an optional ImageFolder class-index subset."""
+    if class_ids is None:
+        return None
+    normalized = [int(class_id) for class_id in class_ids]
+    if not normalized:
+        raise ValueError("--class_ids must contain at least one class ID")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("--class_ids must not contain duplicate class IDs")
+    invalid = [class_id for class_id in normalized
+               if class_id < 0 or class_id >= num_classes]
+    if invalid:
+        raise ValueError(
+            f"--class_ids contains IDs outside [0, {num_classes}): {invalid}"
+        )
+    return normalized
+
+
+def build_dataloader(data_path, img_size, batch_size, num_workers, rank, world_size,
+                     class_ids=None):
     """Build dataloader for an ImageFolder dataset."""
     transform = transforms.Compose([
         transforms.Lambda(lambda img: center_crop_arr(img, img_size)),
         transforms.ToTensor(),
     ])
 
-    dataset = datasets.ImageFolder(os.path.join(data_path, "train"), transform=transform)
+    base_dataset = datasets.ImageFolder(
+        os.path.join(data_path, "train"), transform=transform,
+    )
+    class_ids = validate_class_ids(class_ids, len(base_dataset.classes))
+    if class_ids is None:
+        dataset = base_dataset
+    else:
+        selected = set(class_ids)
+        selected_indices = [
+            index for index, target in enumerate(base_dataset.targets)
+            if target in selected
+        ]
+        if not selected_indices:
+            raise ValueError(
+                f"No images found for --class_ids={class_ids} in {data_path}/train"
+            )
+        dataset = Subset(base_dataset, selected_indices)
+        counts = {
+            class_id: sum(target == class_id for target in base_dataset.targets)
+            for class_id in class_ids
+        }
+        logger.info(
+            "Class subset: ids=%s, counts=%s, total=%d",
+            class_ids, counts, len(dataset),
+        )
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
                                  shuffle=False, drop_last=False) if world_size > 1 else None
     loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
@@ -160,7 +206,7 @@ def main():
 
     loader, total_images = build_dataloader(
         args.data_path, args.img_size, args.batch_size,
-        args.num_workers, rank, world_size,
+        args.num_workers, rank, world_size, class_ids=args.class_ids,
     )
 
     if args.num_images is not None:

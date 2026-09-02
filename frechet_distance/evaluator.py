@@ -329,9 +329,10 @@ def append_eval_csv(
 ):
     """Append one evaluation result row to *csv_path* (rank 0 only)."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H:%M")
+    is_cell = round(inception_score, 4) if inception_score is not None else ""
     row = [
         timestamp, step, ema_label, round(cfg, 2), interval_min, interval_max,
-        num_sampling_steps, num_imgs, round(fid, 6), round(inception_score, 4),
+        num_sampling_steps, num_imgs, round(fid, 6), is_cell,
         round(gen_s_per_img, 4), round(peak_mem_gb, 2), ckpt_path,
     ]
     write_header = not os.path.exists(csv_path)
@@ -365,9 +366,10 @@ def load_eval_cache(csv_path: str) -> dict:
                     int(row["num_sampling_steps"]),
                     int(row["num_imgs"]),
                 )
+                is_raw = row["inception_score"]
                 cache[key] = {
                     "fid": float(row["fid"]),
-                    "inception_score": float(row["inception_score"]),
+                    "inception_score": float(is_raw) if is_raw not in ("", None) else float("nan"),
                 }
         logger.info(f"Loaded {len(cache)} cached results from {csv_path}")
     except Exception as e:

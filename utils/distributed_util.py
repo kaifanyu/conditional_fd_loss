@@ -137,17 +137,32 @@ def preempt_requested() -> bool:
 def _preempt_signal_handler(signum, frame):
     global _preempt_requested
     _preempt_requested = True
+    name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
     logger.info(
-        f"Received signal {signum} (SIGUSR1) — will save checkpoint and exit "
+        f"Received signal {signum} ({name}) — will save checkpoint and exit "
         "after current step."
     )
 
 
-def register_preempt_handler():
+def register_preempt_handler(handle_sigterm: bool = False):
+    """Install the preemption handler.
+
+    SIGUSR1 is always handled.  *handle_sigterm* additionally treats SIGTERM as a
+    preemption request, which matters on shared GPUs: an eviction arrives as
+    SIGTERM, and without a handler the process dies mid-step and loses everything
+    since the last periodic checkpoint.
+
+    It is opt-in rather than the default so existing entry points keep their
+    current behaviour exactly.  Best-effort by design: the launcher that sent the
+    SIGTERM may SIGKILL after its own grace period (torchrun waits ~30 s), so a
+    supervisor that resumes from the last checkpoint is still required — this
+    only shrinks the window, it does not close it.
+    """
     signal.signal(signal.SIGUSR1, _preempt_signal_handler)
-    if _preempt_flag_file:
-        logger.info(
-            f"Registered SIGUSR1 handler; preemption flag file: {_preempt_flag_file}"
-        )
-    else:
-        logger.info("Registered SIGUSR1 handler (no PREEMPT_FLAG_FILE set).")
+    handled = ["SIGUSR1"]
+    if handle_sigterm:
+        signal.signal(signal.SIGTERM, _preempt_signal_handler)
+        handled.append("SIGTERM")
+    suffix = (f"; preemption flag file: {_preempt_flag_file}"
+              if _preempt_flag_file else " (no PREEMPT_FLAG_FILE set)")
+    logger.info("Registered preempt handler for %s%s", "+".join(handled), suffix)

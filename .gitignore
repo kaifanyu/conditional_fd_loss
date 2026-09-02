@@ -15,6 +15,9 @@ data/fid_stats/*.pkl
 data/fid_stats/*.json
 data/fid_stats/*.csv
 
+data/real_clip_feats/*
+data/clip_text_cache/*
+
 # Python artifacts
 __pycache__/
 *.py[cod]
@@ -44,3 +47,10 @@ dist/
 !.gitkeep
 !checkpoints/**/.gitkeep
 !data/**/.gitkeep
+
+
+# other stuff to ignore
+other/*
+kai_results/*
+work_dirs/*
+sweep_logs/*

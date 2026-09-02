@@ -1,0 +1,852 @@
+import argparse
+import datetime
+import logging
+import os
+import sys
+import time
+
+import torch
+import torch.distributed
+
+from utils.builders import create_generation_model, create_tokenizer
+from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
+from utils.distributed_util import all_reduce_mean, preempt_requested, register_preempt_handler
+from utils.eval_util import evaluate_all_emas
+from utils.grad_util import get_grad_norm
+from utils.logging_util import MetricLogger, SmoothedValue
+from utils.optimizer_util import create_optimizer
+from frechet_distance.evaluator import FDEvaluator
+from frechet_distance.queue import FeatureQueue
+from frechet_distance.losses import (
+    all_gather_plain,
+    compute_frechet_distance_loss,
+    diff_all_gather,
+    load_mu_and_sigma_reference, precompute_sigma_ref_sqrt,
+)
+from frechet_distance.gmm import (
+    ClassGMMReference, OnlineClassStats, gmm_posterior_loss,
+)
+from frechet_distance.repr_models import load_repr_model, model_short_name
+from frechet_distance.judges import (
+    extract_judge_features,
+    resolve_per_model_args, save_fd_queue_states, load_fd_queue_states,
+    fill_all_queues, run_sanity_check,
+)
+from utils.rng_util import RNGStateManager, fix_random_seeds
+from utils.schedule_util import adjust_learning_rate
+from utils.setup_util import setup
+from utils.vis_util import visualize
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False
+torch._dynamo.config.capture_scalar_outputs = True
+torch._dynamo.config.cache_size_limit = 128
+torch._dynamo.config.optimize_ddp = False
+
+logger = logging.getLogger("FD_loss")
+
+
+# ---------------------------------------------------------------------------
+# FD train step
+# ---------------------------------------------------------------------------
+
+def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
+                      gmm_judge=None, gmm_scale=None):
+    """Build the (optionally compiled) FD training step.
+
+    ``gmm_judge`` is the judge dict carrying the class-conditional GMM state, or
+    None when the log p / log q term is disabled.  ``gmm_scale`` is a 0-dim CUDA
+    tensor holding the current term weight; it is mutated in place by the
+    training loop so the warm-up ramp never triggers a recompile.
+    """
+    fid_norm_eps = args.fd_fid_norm_eps
+    batch_size = args.batch_size
+    num_classes = args.num_classes
+    input_shape = (args.input_channels, args.input_size, args.input_size)
+    gmm_lambda_ent = args.fd_gmm_lambda_ent
+    gmm_lambda_cls = args.fd_gmm_lambda_cls
+    gmm_use_q = not args.fd_gmm_no_q
+    gmm_mode = args.fd_gmm_mode
+    gmm_clamp = args.fd_gmm_clamp
+    gmm_normalize = not args.fd_gmm_no_normalize
+
+    def fd_train_step():
+        z = torch.randn(batch_size, *input_shape, device="cuda") * args.noise_scale
+        y = torch.randint(0, num_classes, (batch_size,), device="cuda")
+        sampled = model_wo_ddp.sample_images_with_grad(z, y, sampling_args=sampling_args)
+
+        if tokenizer is not None:
+            sampled = tokenizer.decode(tokenizer.denormalize_z(sampled))
+        sampled = sampled * 0.5 + 0.5  # [-1,1] -> [0,1]
+
+        loss = torch.tensor(0.0, device="cuda")
+        loss_dict = {}
+
+        all_new_feats = []
+        for judge in judges:
+            feats = extract_judge_features(judge, sampled)
+            new_feats = diff_all_gather(feats)
+            all_new_feats.append(new_feats)
+
+        for i, judge in enumerate(judges):
+            new_feats = all_new_feats[i]
+
+            _ns_kwargs = dict(sigma_ref_sqrt=judge.get("sigma_ref_sqrt"))
+            if judge["queue"].online_accum or judge["queue"].ema_stats:
+                mu, sigma = judge["queue"].build_feats_stats(new_feats)
+                fid = compute_frechet_distance_loss(judge["mu_ref"], judge["sigma_ref"],
+                                                    mu=mu, sigma=sigma,
+                                                    **_ns_kwargs)
+            else:
+                all_feats = judge["queue"].build_feats_snapshot(new_feats)
+                fid = compute_frechet_distance_loss(judge["mu_ref"], judge["sigma_ref"],
+                                                    all_feats=all_feats,
+                                                    **_ns_kwargs)
+            fid_loss = fid / (fid.detach() + fid_norm_eps)
+            loss = loss + judge["weight"] * fid_loss
+            # Keep diagnostics as device scalars inside the compiled forward;
+            # converting with ``float``/``item`` here can produce an invalid
+            # unbacked scalar in TorchInductor's generated C++ wrapper.
+            loss_dict[f"fid_{judge['name']}"] = fid.detach()
+
+        # -- class-conditional posterior term --------------------------------
+        # The FD term above constrains only the pooled (mu, sigma); this one
+        # constrains the class-conditional structure inside it, which is what
+        # collapse destroys while leaving the pooled moments intact.
+        gmm_z, y_all = None, None
+        if gmm_judge is not None:
+            y_all = all_gather_plain(y)
+            gmm_loss, gmm_parts, gmm_z = gmm_posterior_loss(
+                all_new_feats[gmm_judge["gmm_feat_index"]], y_all,
+                gmm_judge["gmm_ref"], gmm_judge["gmm_online"],
+                lambda_ent=gmm_lambda_ent, lambda_cls=gmm_lambda_cls,
+                use_q=gmm_use_q, mode=gmm_mode, clamp=gmm_clamp,
+                normalize=gmm_normalize,
+            )
+            # gmm_scale is a device tensor, so the warm-up ramp is data, not a
+            # guard: changing it cannot invalidate the compiled graph.
+            loss = loss + gmm_scale * gmm_loss
+            loss_dict.update(gmm_parts)
+
+        loss.backward(create_graph=False)
+
+        if torch.distributed.is_initialized():
+            for parameter in model_wo_ddp.parameters():
+                if parameter.grad is not None:
+                    torch.distributed.all_reduce(
+                        parameter.grad, op=torch.distributed.ReduceOp.AVG
+                    )
+
+        # Queue mutation stays outside compilation. Inductor can otherwise
+        # stale-specialize a circular buffer pointer or reorder chained
+        # in-place state updates across graph breaks. The GMM statistics are
+        # updated outside for the same reason.
+        return (loss, loss_dict, tuple(feats.detach() for feats in all_new_feats),
+                None if gmm_z is None else gmm_z.detach(),
+                None if y_all is None else y_all.detach())
+
+    if args.compile:
+        from utils.runtime_util import _warmup
+        logger.info("[Compilation] Compiling fd_train_step ...")
+        t0 = time.perf_counter()
+        # Compiling requires executing the closure, but those executions must
+        # not become hidden training updates: they consume RNG and accumulate
+        # parameter gradients. Queue mutation is deliberately outside this
+        # closure, so the warm-up cannot alter the FD window.
+        warmup_rng = RNGStateManager()
+        warmup_rng_state = warmup_rng.snapshot()
+        fd_train_step = torch.compile(fd_train_step)
+        _warmup(lambda: fd_train_step(), n=2)
+        for parameter in model_wo_ddp.parameters():
+            parameter.grad = None
+        warmup_rng.load(warmup_rng_state)
+        del warmup_rng_state
+        logger.info(f"[Compilation] fd_train_step compiled in {time.perf_counter() - t0:.2f}s")
+
+    return fd_train_step
+
+
+# ---------------------------------------------------------------------------
+# Class-conditional GMM setup
+# ---------------------------------------------------------------------------
+
+def setup_gmm_judge(judges, args):
+    """Attach the log p / log q state to one judge; return it (or None if off).
+
+    The term is deliberately restricted to a single judge: it is a per-sample
+    signal whose cost is dominated by the (C, k, k) reference, and running it on
+    several representation spaces at once buys redundancy rather than coverage.
+    """
+    if not args.fd_gmm:
+        return None
+
+    if args.fd_gmm_judge is None:
+        index = 0
+    else:
+        names = [judge["name"] for judge in judges]
+        if args.fd_gmm_judge not in names:
+            raise ValueError(
+                f"--fd_gmm_judge='{args.fd_gmm_judge}' not among the configured "
+                f"judges {names}"
+            )
+        index = names.index(args.fd_gmm_judge)
+
+    judge = judges[index]
+    if args.fd_gmm_stats_path is None:
+        raise ValueError("--fd_gmm requires --fd_gmm_stats_path (see compute_class_stats.py)")
+
+    reference = ClassGMMReference.from_npz(
+        args.fd_gmm_stats_path,
+        pca_dim=args.fd_gmm_pca_dim,
+        shrinkage=args.fd_gmm_p_shrinkage,
+    )
+    if reference.proj.shape[0] != judge["feat_dim"]:
+        raise ValueError(
+            f"GMM stats were fitted on {reference.proj.shape[0]}-d features but judge "
+            f"'{judge['name']}' produces {judge['feat_dim']}-d. The projection must be "
+            f"fitted on the same representation space."
+        )
+    if reference.num_classes != args.num_classes:
+        raise ValueError(
+            f"GMM stats have {reference.num_classes} classes, run has {args.num_classes}"
+        )
+
+    online = OnlineClassStats(
+        num_classes=args.num_classes,
+        k=reference.k,
+        ema_beta=args.fd_gmm_ema_beta,
+        shrinkage=args.fd_gmm_q_shrinkage,
+    ).cuda()
+
+    judge["gmm_ref"] = reference
+    judge["gmm_online"] = online
+    judge["gmm_feat_index"] = index
+    # Initialise the cache from the empty state so ``logits`` is never read
+    # against zeroed buffers (e.g. when queue_size=0 skips the bootstrap).
+    online.refresh_cache(reference)
+
+    logger.info(
+        f"[GMM] Attached to judge '{judge['name']}': k={reference.k}, "
+        f"weight={args.fd_gmm_weight}, lambda_cls={args.fd_gmm_lambda_cls}, "
+        f"lambda_ent={args.fd_gmm_lambda_ent}, mode={args.fd_gmm_mode}, "
+        f"q_ema_beta={args.fd_gmm_ema_beta}, p_shrink={args.fd_gmm_p_shrinkage}, "
+        f"q_shrink={args.fd_gmm_q_shrinkage}, warmup={args.fd_gmm_warmup_steps} steps"
+        + (" [ABLATION: q term disabled]" if args.fd_gmm_no_q else "")
+    )
+    return judge
+
+
+@torch.no_grad()
+def bootstrap_gmm_stats(gmm_judge, model, args, tokenizer=None):
+    """Seed the generated-side statistics before the loss switches on.
+
+    Shares its sampling budget with the FD queue fill: ``--fd_gmm_bootstrap``
+    samples spread over ``num_classes`` gives ~n/C observations per class, which
+    is enough for per-class *means* (the only per-class quantity q estimates)
+    even though it would be far too few for per-class covariances.
+    """
+    if gmm_judge is None or args.fd_gmm_bootstrap <= 0:
+        return
+
+    online = gmm_judge["gmm_online"]
+    reference = gmm_judge["gmm_ref"]
+    model.eval()
+    filled = 0
+    while filled < args.fd_gmm_bootstrap:
+        bsz = min(args.fd_queue_fill_bsz, args.fd_gmm_bootstrap - filled)
+        y = torch.randint(0, args.num_classes, (bsz,), device="cuda")
+        imgs = model.generate(bsz, y, cfg=args.cfg, args=args, verbose=False)
+        imgs = tokenizer.detokenize(imgs) if tokenizer is not None else imgs * 0.5 + 0.5
+
+        feats = extract_judge_features(gmm_judge, imgs)
+        feats_all = diff_all_gather(feats).detach()
+        y_all = all_gather_plain(y)
+        online.update(reference.project(feats_all), y_all)
+
+        filled += bsz
+        if filled % (args.fd_queue_fill_bsz * 20) == 0 or filled >= args.fd_gmm_bootstrap:
+            logger.info(f"[GMM] Bootstrap: {filled}/{args.fd_gmm_bootstrap} "
+                        f"(class coverage {online.coverage * 100:.1f}%)")
+
+    online.refresh_cache(reference)
+    stats = online.diagnostics(reference)
+    logger.info(f"[GMM] Bootstrap done ({int(online.total_seen.item())} samples): "
+                + ", ".join(f"{k}={v:.4f}" for k, v in stats.items()))
+
+
+# ---------------------------------------------------------------------------
+# Main training loop
+# ---------------------------------------------------------------------------
+
+def train_and_evaluate(args):
+    wandb_logger = setup(args)
+    register_preempt_handler()
+
+    # -- models, optimizer, checkpoint --
+    tokenizer = create_tokenizer(args)
+    model, ema_model = create_generation_model(args)
+    optimizer = create_optimizer(args, model, print_trainable_params=True)
+    model_wo_ddp = model
+
+    extra = ckpt_resume(
+        args, model_wo_ddp, optimizer, ema_model,
+        extra_keys=["fd_queue_states", "fd_gmm_state", "rng_state", "experiment_fingerprint"],
+        expected_experiment_fingerprint=args.experiment_fingerprint,
+    )
+
+    # ``MetricLogger.log_every`` consumes an item before checking its bound.
+    # Guard here so re-invoking an already-complete auto-resume run cannot
+    # accidentally execute one additional optimization step.
+    if args.current_step >= args.total_steps:
+        logger.info(f"Training already complete at step {args.current_step:,}; exiting.")
+        return 0
+
+    rng = RNGStateManager()
+    rng.save()
+    if (not args.disable_vis) or args.vis_only:
+        visualize(args, model_wo_ddp, ema_model, args.current_step, rng=rng, tokenizer=tokenizer)
+        if args.vis_only:
+            return 0
+
+    # -- frechet distance evaluator --
+    repr_model_eval, feat_dim_eval, _, _ = load_repr_model("inception")
+    fid_evaluator = FDEvaluator(repr_model_eval, feat_dim_eval, args.fid_stats_path)
+
+    # -- frechet distance system: repr models, queues --
+    resolve_per_model_args(args)
+
+    judges = []
+    for name, stats_path, weight, pool_type, ts in zip(
+        args.fd_repr_models, args.fd_repr_stats_paths,
+        args.fd_repr_weights, args.fd_repr_pool_types, args.fd_target_sizes,
+    ):
+        repr_model, feat_dim, _, _ = load_repr_model(name, target_size=ts)
+        mu_ref, sigma_ref = load_mu_and_sigma_reference(stats_path, pool_type=pool_type)
+        queue = FeatureQueue(size=args.queue_size, feat_dim=feat_dim,
+                             online_accum=args.fd_online_accum,
+                             ema_beta=args.fd_ema_beta).cuda()
+        short = model_short_name(name)
+        sigma_ref_sqrt = None
+        if args.fd_eigvalsh:
+            sigma_ref_sqrt = precompute_sigma_ref_sqrt(sigma_ref)
+        judges.append({
+            "name": short, "model": repr_model,
+            "feat_dim": feat_dim,
+            "pool_type": pool_type,
+            "mu_ref": mu_ref, "sigma_ref": sigma_ref,
+            "sigma_ref_sqrt": sigma_ref_sqrt,
+            "queue": queue, "weight": weight,
+        })
+        eig_mode = "eigvalsh" if args.fd_eigvalsh else "eigvals"
+        stats_mode = f"ema(beta={args.fd_ema_beta})" if args.fd_ema_beta > 0 else ("online_accum" if args.fd_online_accum else "snapshot")
+        logger.info(f"[FD] Repr '{short}' ({name}): feat_dim={feat_dim}, "
+                     f"weight={weight}, pool={pool_type}, stats={stats_path}, "
+                     f"eig_mode={eig_mode}, stats_mode={stats_mode}")
+
+    # -- class-conditional GMM term (log p / log q) --
+    gmm_judge = setup_gmm_judge(judges, args)
+    gmm_scale = torch.zeros((), device="cuda")
+
+    fd_restored = (extra is not None
+                   and "fd_queue_states" in extra
+                   and load_fd_queue_states(judges, extra["fd_queue_states"]))
+    gmm_restored = False
+    if gmm_judge is not None and extra is not None and extra.get("fd_gmm_state") is not None:
+        gmm_judge["gmm_online"].load_state_dict(extra["fd_gmm_state"])
+        gmm_judge["gmm_online"].cuda()
+        gmm_judge["gmm_online"].refresh_cache(gmm_judge["gmm_ref"])
+        gmm_restored = True
+        logger.info("[GMM] Restored generated-side class statistics from checkpoint")
+
+    if fd_restored:
+        logger.info("[FD] Restored all queue states from checkpoint — skipping queue fill")
+        run_sanity_check(judges, args.queue_size, args=args)
+        if gmm_judge is not None and not gmm_restored:
+            # Queues came from a run that predates the GMM term; q has to be
+            # seeded from scratch or the first steps would train against noise.
+            logger.info("[GMM] No saved statistics — running a standalone bootstrap pass")
+            bootstrap_gmm_stats(gmm_judge, model_wo_ddp, args, tokenizer=tokenizer)
+    else:
+        logger.info(f"[FD] Filling {len(judges)} feature queue(s) "
+                    f"({args.queue_size} entries each) ...")
+        fill_all_queues(judges, model_wo_ddp, args, tokenizer=tokenizer,
+                        gmm_judge=None if gmm_restored else gmm_judge)
+        run_sanity_check(judges, args.queue_size, args=args)
+    # Queue initialization consumes a number of random draws proportional to
+    # queue size.  Reset before the first update so queue-size ablations use
+    # the same training noise/label stream.  On resume, restore the exact
+    # post-step state captured in the checkpoint instead.
+    if extra is not None and "rng_state" in extra:
+        saved_rng = extra["rng_state"]
+        if "states_by_rank" in saved_rng:
+            saved_world_size = int(saved_rng["world_size"])
+            if saved_world_size != args.world_size:
+                raise RuntimeError(
+                    f"RNG checkpoint world size {saved_world_size} does not match "
+                    f"current world size {args.world_size}"
+                )
+            rng.load(saved_rng["states_by_rank"][args.rank])
+        else:
+            # Backward compatibility for checkpoints written before per-rank
+            # RNG states were introduced. They are exact only for world size 1.
+            if args.world_size != 1:
+                raise RuntimeError(
+                    "Legacy single-state RNG checkpoint cannot resume a multi-GPU run exactly"
+                )
+            rng.load(saved_rng)
+        logger.info("[RNG] Restored training RNG state from checkpoint")
+    else:
+        fix_random_seeds(args.seed + args.rank)
+        logger.info(f"[RNG] Reset training RNG state to seed {args.seed + args.rank}")
+    del extra
+    torch.distributed.barrier()
+
+    model.train()
+    args.input_channels = model_wo_ddp.in_channels
+    args.input_size = model_wo_ddp.input_size
+
+    # -- FD train step closure --
+    sampling_args = {
+        "t_min": args.interval_min,
+        "t_max": args.interval_max,
+        "cfg": args.cfg,
+        "num_steps": args.num_sampling_steps,
+    }
+    fd_train_step = get_fd_train_step(
+        model_wo_ddp, judges, sampling_args, args, tokenizer=tokenizer,
+        gmm_judge=gmm_judge, gmm_scale=gmm_scale,
+    )
+
+    # -- training loop --
+    logger.info(f"training from step {args.current_step:,} -> {args.total_steps:,} "
+                f"({args.start_epoch} -> {args.epochs} epochs)")
+
+    global_bsz = args.batch_size * args.world_size
+    ckpt_saver = AsyncCheckpointSaver()
+    session_start = time.time()
+    step_start = time.perf_counter()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+    # dynamic checkpoint frequency: target ~10 min between saves
+    ckpt_target_minutes = 10.0
+    ckpt_measure_interval = 1000
+    ckpt_timer_start = time.perf_counter()
+    ckpt_timer_step = args.current_step
+    last_ckpt_step = args.current_step
+
+    # metric logger
+    metric_file = os.path.join(args.log_dir, "training_metrics.json")
+    metric_logger = MetricLogger(delimiter="  ", output_file=metric_file, prefetch=True)
+    for name, window, fmt in [
+        ("lr",               1,               "{value:.6f}"),
+        ("samples/s/device", args.print_freq, "{avg:.2f}"),
+        ("samples/s",        args.print_freq, "{avg:.2f}"),
+        ("samples_seen(M)",  args.print_freq, "{value:.2f}"),
+        ("device_mem(GB)",   args.print_freq, "{value:.2f}"),
+    ]:
+        metric_logger.add_meter(name, SmoothedValue(window, fmt))
+
+    def _infinite():
+        while True:
+            yield None
+
+    for step, _ in metric_logger.log_every(
+        _infinite(), args.print_freq, header="Train:",
+        start_iteration=args.current_step, n_iterations=args.total_steps,
+    ):
+        model.train()
+        adjust_learning_rate(optimizer, step, args)
+
+        # Ramp the GMM term in. q's per-class means are seeded from the
+        # bootstrap but are still the noisiest they will ever be at step 0, so
+        # a short linear ramp keeps early gradients from being dominated by
+        # estimation error rather than by real class-conditional mismatch.
+        if gmm_judge is not None:
+            warmup = args.fd_gmm_warmup_steps
+            ramp = 1.0 if warmup <= 0 else min(1.0, (step + 1) / warmup)
+            gmm_scale.fill_(args.fd_gmm_weight * ramp)
+
+        loss, loss_dict, all_new_feats, gmm_z, gmm_y = fd_train_step()
+        for judge, new_feats in zip(judges, all_new_feats):
+            judge["queue"].enqueue(new_feats)
+        if gmm_judge is not None:
+            online = gmm_judge["gmm_online"]
+            online.update(gmm_z, gmm_y)
+            online.refresh_cache(gmm_judge["gmm_ref"])
+
+        grad_norm = (torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                     if args.grad_clip > 0.0 else get_grad_norm(model.parameters()))
+
+        if torch.isfinite(grad_norm):
+            optimizer.step()
+            ema_model.step(model)
+        else:
+            logger.warning(f"[step {step}] NaN/Inf grad_norm — skipping optimizer & EMA update")
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+
+        args.current_step = step + 1
+        args.samples_seen += global_bsz
+
+        # timing & metrics
+        step_time = time.perf_counter() - step_start
+        step_start = time.perf_counter()
+
+        loss_value = all_reduce_mean(loss.item())
+        loss_dict = {
+            key: all_reduce_mean(value.item())
+            for key, value in loss_dict.items()
+        }
+
+        # Collapse meters. Every rank holds identical GMM state (it is updated
+        # from all-gathered features), so no reduction is needed. The .item()
+        # calls force a sync, so only pay for them at logging cadence.
+        if gmm_judge is not None and step % args.print_freq == 0:
+            loss_dict.update(gmm_judge["gmm_online"].diagnostics(gmm_judge["gmm_ref"]))
+            loss_dict["gmm_scale"] = float(gmm_scale.item())
+        sps = args.batch_size / step_time if step_time > 0 else 0.0
+        mem_gb = torch.cuda.max_memory_reserved() / (1024 ** 3) if torch.cuda.is_available() else 0.0
+
+        metric_logger.update(
+            loss=loss_value, grad_norm=grad_norm,
+            lr=optimizer.param_groups[0]["lr"],
+            **{"samples/s/device": sps, "samples/s": sps * args.world_size,
+               "samples_seen(M)": args.samples_seen / 1e6, "device_mem(GB)": mem_gb},
+            **loss_dict,
+        )
+
+        # wandb
+        if step % args.print_freq == 0 and wandb_logger:
+            elapsed = time.time() - session_start + args.last_elapsed_time
+            remaining = args.total_steps - args.current_step
+            eta = elapsed / args.current_step * remaining if args.current_step > 0 else 0.0
+            elapsed_h = elapsed / 3600
+            wandb_logger.update({
+                "train/loss": loss_value,
+                "train/lr": optimizer.param_groups[0]["lr"],
+                "train/grad_norm": grad_norm,
+                "train/samples_seen_M": args.samples_seen / 1e6,
+                "perf/samples_per_sec_per_device": sps,
+                "perf/samples_per_sec": sps * args.world_size,
+                "perf/max_reserved_mem_gb": mem_gb,
+                "perf/elapsed_real_hours": elapsed_h,
+                "perf/elapsed_device_hours": elapsed_h * args.world_size,
+                "perf/eta_real_hours": eta / 3600,
+                "perf/eta_device_hours": eta / 3600 * args.world_size,
+                **{f"train/{k}": v for k, v in loss_dict.items()},
+            }, step=args.current_step)
+
+        # dynamic checkpoint frequency
+        steps_since_timer = args.current_step - ckpt_timer_step
+        if steps_since_timer >= ckpt_measure_interval:
+            elapsed_minutes = (time.perf_counter() - ckpt_timer_start) / 60.0
+            minutes_per_step = elapsed_minutes / steps_since_timer
+            new_save_every = max(100, round(ckpt_target_minutes / minutes_per_step / 100) * 100)
+            if new_save_every != args.save_every:
+                logger.info(f"adjusting save_every: {args.save_every} -> {new_save_every} "
+                            f"({minutes_per_step * 1000:.1f} min/1k steps)")
+                args.save_every = new_save_every
+            ckpt_timer_start = time.perf_counter()
+            ckpt_timer_step = args.current_step
+
+        # checkpoint
+        def _save(saver=ckpt_saver):
+            elapsed = time.time() - session_start + args.last_elapsed_time
+            local_rng_state = rng.snapshot()
+            if args.world_size > 1:
+                states_by_rank = [None] * args.world_size if args.rank == 0 else None
+                torch.distributed.gather_object(
+                    local_rng_state, states_by_rank, dst=0
+                )
+            else:
+                states_by_rank = [local_rng_state]
+            rng_state = {
+                "world_size": args.world_size,
+                "states_by_rank": states_by_rank,
+            }
+            fd_extra = {
+                "fd_queue_states": save_fd_queue_states(judges),
+                "rng_state": rng_state,
+                "experiment_fingerprint": args.experiment_fingerprint,
+            } if judges else {
+                "rng_state": rng_state,
+                "experiment_fingerprint": args.experiment_fingerprint,
+            }
+            # The generated-side GMM has a ~1/(1-beta) sample memory; refitting
+            # it from scratch on resume would silently restart the ramp.
+            if gmm_judge is not None:
+                fd_extra["fd_gmm_state"] = gmm_judge["gmm_online"].state_dict()
+            save_checkpoint(args, step, model_wo_ddp, optimizer, ema_model, elapsed,
+                            saver=saver, extra=fd_extra)
+            torch.distributed.barrier()
+
+        if (args.current_step - last_ckpt_step >= args.save_every
+                or args.current_step == args.total_steps):
+            _save()
+            last_ckpt_step = args.current_step
+
+        if args.milestone_every > 0 and step > 0 and step % args.milestone_every == 0:
+            _save()
+
+        # slurm preemption
+        if preempt_requested():
+            logger.info(f"Preemption at step {args.current_step}: saving checkpoint ...")
+            ckpt_saver.wait()
+            _save(saver=None)
+            logger.info(f"Preemption checkpoint saved at step {args.current_step}. Exiting.")
+            return 0
+
+        # visualization
+        if args.vis_every > 0 and args.current_step % args.vis_every == 0:
+            visualize(args, model_wo_ddp, ema_model, args.current_step, rng=rng, tokenizer=tokenizer)
+            model_wo_ddp.train()
+
+        # online evaluation
+        if args.eval_every > 0 and args.online_eval and args.current_step % args.eval_every == 0:
+            torch.cuda.empty_cache()
+            evaluate_all_emas(
+                args, model_wo_ddp, ema_model, fid_evaluator, tokenizer,
+                step=args.current_step, wandb_logger=wandb_logger,
+                cfg=args.cfg, num_images=args.num_images_for_eval_and_search,
+            )
+            model_wo_ddp.train()
+
+    # -- final --
+    ckpt_saver.wait()
+    total = time.time() - session_start + args.last_elapsed_time
+    metric_logger.synchronize_between_processes()
+    logger.info(f"averaged stats: {metric_logger}")
+    logger.info(f"Training complete. Total time: {datetime.timedelta(seconds=int(total))} "
+                f"on {args.world_size} devices")
+    torch.cuda.empty_cache()
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def get_args_parser():
+    parser = argparse.ArgumentParser("FD loss fine-tuning for generation models", add_help=False)
+
+    # training
+    parser.add_argument("--start_epoch", default=0, type=int)
+    parser.add_argument("--epochs", default=200, type=int)
+    parser.add_argument("--steps_per_epoch", default=1250, type=int)
+    parser.add_argument("--batch_size", default=32, type=int, help="batch size per GPU")
+    parser.add_argument("--noise_scale", type=float, default=1.0)
+    parser.add_argument("--same_noise", action="store_true")
+
+    # model architecture
+    parser.add_argument("--model", default="pMF_B", type=str)
+    parser.add_argument("--img_size", default=256, type=int)
+    parser.add_argument("--patch_size", default=16, type=int)
+    parser.add_argument("--label_drop_prob", default=0.1, type=float)
+    parser.add_argument("--attn_dropout", type=float, default=0.0)
+    parser.add_argument("--proj_dropout", type=float, default=0.0)
+    parser.add_argument("--class_tokens", type=int, default=8)
+    parser.add_argument("--time_tokens", type=int, default=4)
+    parser.add_argument("--guidance_tokens", type=int, default=4)
+    parser.add_argument("--interval_tokens", type=int, default=2)
+    parser.add_argument("--norm_eps", type=float, default=0.01)
+    parser.add_argument("--norm_p", type=float, default=1.0)
+    parser.add_argument("--rope_2d", action="store_true")
+    parser.add_argument("--learned_pe", action="store_true")
+    parser.add_argument("--disable_v_head", action="store_true")
+    parser.add_argument("--t_eps", type=float, default=5e-2)
+
+    # tokenizer
+    parser.add_argument("--tokenizer", default=None, type=str)
+    parser.add_argument("--token_channels", default=3, type=int)
+    parser.add_argument("--tokenizer_patch_size", default=1, type=int)
+
+    # optimization
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--min_lr", type=float, default=1e-6)
+    parser.add_argument("--lr_sched", type=str, default="constant", choices=["constant", "cosine"])
+    parser.add_argument("--warmup_rate", type=float, default=0.0)
+    parser.add_argument("--warmup_epochs", type=int, default=-1)
+    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--grad_clip", type=float, default=0.0, help="gradient clip, 0.0 means no clip")
+    parser.add_argument("--beta1", type=float, default=0.9)
+    parser.add_argument("--beta2", type=float, default=0.95)
+    parser.add_argument("--use_muon", action="store_true")
+    parser.add_argument("--muon_lr", type=float, default=1e-3)
+    parser.add_argument("--muon_momentum", type=float, default=0.95)
+    parser.add_argument("--muon_weight_decay", type=float, default=0.0)
+    parser.add_argument("--ema_type", default="edm", type=str, choices=["const", "edm"])
+    parser.add_argument("--ema_rates", default=[0.9999, 0.9996], type=float, nargs="+")
+    parser.add_argument("--ema_halflife_kimg", default=[250, 500, 1000, 2000], type=float, nargs="+")
+    parser.add_argument("--eval_ema_labels", default=None, type=str, nargs="+")
+
+    parser.add_argument("--grad_checkpointing", action="store_true")
+
+    # diffusion / flow-matching
+    parser.add_argument("--P_mean", type=float, default=0.8)
+    parser.add_argument("--P_std", type=float, default=0.8)
+    parser.add_argument("--legacy_time_convention", action="store_true")
+    parser.add_argument("--tr_uniform", action="store_true")
+    parser.add_argument("--ratio_r_neq_t", type=float, default=0.5)
+    parser.add_argument("--cfg_beta", type=float, default=1.0)
+    parser.add_argument("--cfg_omega_max", type=float, default=7.0)
+    parser.add_argument("--aux_head_depth", type=int, default=8)
+    parser.add_argument("--loss_type", type=str, default="v", choices=["v", "x"])
+    parser.add_argument("--aux_pred_type", type=str, default="v", choices=["v", "x"])
+    parser.add_argument("--perceptual_threshold", type=float, default=0.8)
+    parser.add_argument("--perceptual_loss_on_aux", action="store_true")
+
+    # sampling & generation
+    parser.add_argument("--sampling_method", type=str, default="heun", choices=["euler", "heun"])
+    parser.add_argument("--num_sampling_steps", type=int, default=50)
+    parser.add_argument("--cfg", default=4.0, type=float)
+    parser.add_argument("--cfg_list", type=float, nargs="+",
+                        default=[2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 8.5, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0])
+    parser.add_argument("--interval_min", type=float, default=0.1)
+    parser.add_argument("--interval_max", type=float, default=1.0)
+    parser.add_argument("--vis_steps", default=[1], type=int, nargs="+")
+
+    # data
+    parser.add_argument("--data_path", default="./data/imagenet/train", type=str)
+    parser.add_argument("--num_classes", default=1000, type=int)
+    parser.add_argument("--class_of_interest", default=[207, 360, 387, 974, 88, 979, 417, 279],
+                        type=int, nargs="+")
+    parser.add_argument("--force_class_of_interest", action="store_true")
+    parser.add_argument("--num_workers", default=10, type=int)
+    parser.add_argument("--pin_mem", action="store_true")
+    parser.add_argument("--no_pin_mem", action="store_false", dest="pin_mem")
+    parser.set_defaults(pin_mem=True)
+
+    # checkpointing
+    parser.add_argument("--auto_resume", action="store_true")
+    parser.add_argument("--resume_from", default=None)
+    parser.add_argument("--load_from", type=str, default=None)
+    parser.add_argument("--keep_n_ckpts", default=3, type=int)
+    parser.add_argument("--milestone_interval", default=20, type=int)
+
+    # evaluation
+    parser.add_argument("--online_eval", action="store_true")
+    parser.add_argument("--num_images_for_eval_and_search", default=10000, type=int)
+    parser.add_argument("--num_images", default=50000, type=int)
+    parser.add_argument("--eval_bsz", type=int, default=64)
+    parser.add_argument("--fid_stats_path", type=str, default="data/fid_stats/guided_diffusion_stats.npz")
+    parser.add_argument("--keep_eval_folder", action="store_true")
+
+    parser.add_argument("--save_eval_images", action="store_true")
+    parser.add_argument("--cfg_min", default=1.0, type=float)
+    parser.add_argument("--cfg_max", default=25.0, type=float)
+    parser.add_argument("--overwrite_cache", action="store_true")
+
+    # FD fine-tuning
+    parser.add_argument("--queue_size", type=int, default=50000)
+    parser.add_argument("--fd_fid_norm_eps", type=float, default=0.01)
+    parser.add_argument("--fd_queue_fill_bsz", type=int, default=256)
+    parser.add_argument("--fd_repr_models", type=str, nargs="+", default=["inception"],
+                        help="feature extractors: 'inception' or timm model names")
+    parser.add_argument("--fd_repr_stats_paths", type=str, nargs="+", default=None,
+                        help="reference stats (.npz) per repr model; auto-inferred if omitted")
+    parser.add_argument("--fd_repr_weights", type=float, nargs="+", default=None,
+                        help="per-model FID loss weight (default 1.0 each)")
+    parser.add_argument("--fd_repr_pool_types", type=str, nargs="+", default=None,
+                        help="pool type per repr model: 'cls' or 'avg' (default 'cls')")
+    parser.add_argument("--fd_target_sizes", type=int, nargs="+", default=None,
+                        help="per-model target resolution override (default: model's native size)")
+    parser.add_argument("--fd_online_accum", action="store_true",
+                        help="use online accumulators for FD (avoids cloning 50k queue each step)")
+    parser.add_argument("--fd_eigvalsh", action="store_true",
+                        help="use eigvalsh on symmetric product instead of eigvals (~8x faster, exact)")
+    parser.add_argument("--fd_ema_beta", type=float, default=0.0, metavar="BETA",
+                        help="EMA decay for FD stats (0=disabled, use queue). "
+                             "Implies online_accum. E.g. 0.999 → ~1000-batch window")
+
+    # Class-conditional GMM posterior term (log p / log q).
+    # FD constrains the pooled (mu, sigma) only; this constrains the
+    # class-conditional structure inside it. See frechet_distance/gmm.py.
+    parser.add_argument("--fd_gmm", action="store_true",
+                        help="enable the class-conditional log p / log q posterior term")
+    parser.add_argument("--fd_gmm_stats_path", type=str, default=None,
+                        help="real-data class GMM stats (.npz) from compute_class_stats.py")
+    parser.add_argument("--fd_gmm_judge", type=str, default=None,
+                        help="short name of the judge to attach the term to (default: first)")
+    parser.add_argument("--fd_gmm_pca_dim", type=int, default=None,
+                        help="truncate the whitened PCA space to this many dims "
+                             "(default: whatever the stats file stores)")
+    parser.add_argument("--fd_gmm_weight", type=float, default=0.002,
+                        help="overall weight of the GMM term. Calibrated so its gradient "
+                             "is comparable to the FD term's rather than swamping it: on "
+                             "pMF-B/inception, FD-only grad_norm is ~0.0125 and this "
+                             "value takes the total to ~0.021. Recalibrate by measuring "
+                             "grad_norm with --fd_gmm off and targeting ~2x.")
+    parser.add_argument("--fd_gmm_lambda_ent", type=float, default=1.0,
+                        help="weight of the anti-collapse posterior-KL term "
+                             "E_x[KL(q(.|x)||p(.|x))]. 0.0 leaves pure classifier "
+                             "guidance, which is collapse-promoting (ablation only)")
+    parser.add_argument("--fd_gmm_lambda_cls", type=float, default=0.1,
+                        help="weight of the class-fidelity term E[-log p(c|x)]. Kept "
+                             "small on purpose: measured at parity it contributes ~92%% "
+                             "of the GMM gradient, and it is the *contractive* term, so "
+                             "letting it dominate would defeat the point of the loss.")
+    parser.add_argument("--fd_gmm_mode", type=str, default="density",
+                        choices=["density", "posterior"],
+                        help="anti-collapse term: 'density' = class-conditional "
+                             "KL(q(.|c)||p(.|c)) whose repulsion strengthens as q "
+                             "tightens; 'posterior' = KL(q(.|x)||p(.|x)), bounded but "
+                             "degenerates to classifier guidance under collapse")
+    parser.add_argument("--fd_gmm_clamp", type=float, default=3.0,
+                        help="per-sample bound on the density log-ratio in batch "
+                             "standard deviations about the batch mean, so it guards "
+                             "outliers rather than reshaping the loss")
+    parser.add_argument("--fd_gmm_no_normalize", action="store_true",
+                        help="disable the fid-style self-normalisation of each GMM term")
+    parser.add_argument("--fd_gmm_no_q", action="store_true",
+                        help="ABLATION: drop the q term entirely (-log p only)")
+    parser.add_argument("--fd_gmm_ema_beta", type=float, default=0.999,
+                        help="per-class EMA decay for the generated-side statistics")
+    parser.add_argument("--fd_gmm_p_shrinkage", type=float, default=0.25,
+                        help="shrink real per-class covariances toward the pooled "
+                             "within-class covariance by this weight")
+    parser.add_argument("--fd_gmm_q_shrinkage", type=float, default=0.25,
+                        help="shrink the generated tied covariance toward the real pooled "
+                             "within-class covariance; also floors it against collapse")
+    parser.add_argument("--fd_gmm_warmup_steps", type=int, default=2000,
+                        help="linear ramp of the posterior term over this many steps")
+    parser.add_argument("--fd_gmm_bootstrap", type=int, default=50000,
+                        help="samples for a standalone q bootstrap when queue states are "
+                             "restored but GMM state is not; 0 disables")
+    # logging & tracking
+    parser.add_argument("--output_dir", default="./work_dirs")
+    parser.add_argument("--local_eval_dir", type=str, default=None)
+    parser.add_argument("--print_freq", type=int, default=50)
+    parser.add_argument("--eval_freq", type=int, default=10)
+    parser.add_argument("--vis_freq", type=int, default=10)
+    parser.add_argument("--val_freq", type=int, default=10)
+    parser.add_argument("--save_freq", type=int, default=5)
+    parser.add_argument("--vis_only", action="store_true")
+    parser.add_argument("--disable_vis", action="store_true")
+    parser.add_argument("--last_elapsed_time", type=float, default=0.0)
+    parser.add_argument("--current_step", type=int, default=0)
+    parser.add_argument("--samples_seen", type=int, default=0)
+    parser.add_argument("--project", default="One3", type=str)
+    parser.add_argument("--entity", default=None, type=str)
+    parser.add_argument("--exp_name", default=None, type=str)
+    parser.add_argument("--enable_wandb", action="store_true")
+    parser.add_argument("--disable_wandb", action="store_false", dest="enable_wandb")
+
+    # system
+    parser.add_argument("--seed", default=1, type=int)
+    parser.add_argument("--dtype", default="bf16", type=str, choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument(
+        "--experiment_fingerprint", type=str, default=None,
+        help="immutable launcher-provided identity stored in checkpoints and checked on resume",
+    )
+
+    return parser
+
+
+if __name__ == "__main__":
+    args = get_args_parser().parse_args()
+    sys.exit(train_and_evaluate(args))

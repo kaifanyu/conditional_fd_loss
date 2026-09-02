@@ -84,6 +84,12 @@ def create_generation_model(args):
             norm_eps=args.norm_eps,
             norm_p=args.norm_p,
         )
+    elif args.model in models.RFDenoiser_models:
+        model = models.RFDenoiser_models[args.model](
+            num_classes=args.num_classes,
+            dropout=getattr(args, "rf_dropout", 0.0),
+            grad_checkpoint=getattr(args, "rf_grad_checkpoint", True),
+        )
     else:
         raise ValueError(f"Unsupported model {args.model}")
 

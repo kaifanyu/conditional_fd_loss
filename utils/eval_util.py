@@ -232,8 +232,9 @@ def evaluate_single_config(
         f"total={datetime.timedelta(seconds=int(elapsed))} "
         f"mem={torch.cuda.max_memory_reserved()/1024**3:.1f}G"
     )
+    is_str = f"{metrics['inception_score']:.2f}" if metrics['inception_score'] is not None else "n/a"
     logger.info(
-        f"  ema={ema_label} fid={metrics['fid']:.4f}  is={metrics['inception_score']:.2f}  n={metrics['num_images']}  "
+        f"  ema={ema_label} fid={metrics['fid']:.4f}  is={is_str}  n={metrics['num_images']}  "
         f"cfg={cfg}  interval_min={args.interval_min}  interval_max={args.interval_max}  steps={args.num_sampling_steps}"
     )
 
@@ -323,7 +324,8 @@ def evaluate_all_emas(
             m["fid"] = dist.broadcast_scalar(m["fid"])
             m["inception_score"] = dist.broadcast_scalar(m["inception_score"])
             m["num_images"] = num_images
-            logger.info(f"  [cached] {ema_label}: fid={m['fid']:.4f}  is={m['inception_score']:.2f}")
+            is_c = f"{m['inception_score']:.2f}" if m['inception_score'] is not None else "n/a"
+            logger.info(f"  [cached] {ema_label}: fid={m['fid']:.4f}  is={is_c}")
             return m
         return evaluate_single_config(
             args, model, ema_model, fid_evaluator, tokenizer,
