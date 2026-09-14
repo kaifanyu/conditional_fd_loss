@@ -1,9 +1,12 @@
 """FD post-training with the sampled-label VLM posterior-delta conditional term.
 
     L = sum_j FD_j / (FD_j.detach() + eps)                        # marginal
-      + w(s) * E[ log q_teacher(c | z) - log p(c | z) ],  z = E_VLM(G(eps, c))
+      + w(s) * E[ log q(c | z) - log p(c | z) ],  z = E_VLM(G(eps, c))
 
-One frozen VLM and two linear heads on top of it.  Which VLM is decided by the
+By default, one frozen VLM and two linear heads on top of it. With
+``--vlm_q_lora``, Qwen q additionally learns LoRA adapters; p always uses the
+unadapted backbone. See ``docs/vlm_lora_q.md`` for the image-based update path.
+Which VLM is decided by the
 p-head checkpoint, not by a flag here -- the head *is* the definition of ``z``:
 
     ``vlm_backend=timm``               SigLIP-SO400M's CLS token.  It is already
@@ -25,7 +28,8 @@ The two linear heads are:
     q_psi   initialised from p, then trained online by cross entropy on
             DETACHED generated (image, sampled label) pairs
 
-The generator loss uses a slow EMA teacher of q, never the raw student.  At
+The generator loss uses the current q student with detached parameters. An EMA
+teacher is available only with ``--vlm_q_use_ema`` for comparisons. At
 initialisation q == p exactly, so the term is exactly zero and supplies exactly
 zero gradient; it only becomes a force as q learns what the *current* generator
 actually looks like.
@@ -59,15 +63,18 @@ import os
 import sys
 import time
 from collections import deque
+from functools import partial
 from pathlib import Path
 
 import torch
 import torch.distributed
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from utils.builders import create_generation_model, create_tokenizer
 from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
-from utils.distributed_util import all_reduce_mean, preempt_requested, register_preempt_handler
+from utils.distributed_util import (all_reduce_mean, broadcast_bool, preempt_requested,
+                                    register_preempt_handler)
 from utils.eval_util import evaluate_all_emas
 from utils.grad_util import get_grad_norm
 from utils.logging_util import MetricLogger, SmoothedValue
@@ -92,6 +99,8 @@ from utils.setup_util import setup
 from utils.vis_util import visualize
 
 from classifier_ensemble import ProbeClassifier  # held-out canary, never in the loss
+from vlm_lora_q import (LoRAQ, build_lora_optimizer, load_q_optimizer_state,
+                        q_lora_update_step, validate_loss_scale)
 from vlm_linear_heads import (
     P_HEAD_BACKEND_QWEN,
     P_HEAD_BACKEND_TIMM,
@@ -405,6 +414,13 @@ def setup_vlm_delta(judges, judge_model_names, args):
     ckpt = load_p_head_checkpoint(args.vlm_p_head)
     identity = p_head_identity(ckpt)
     backend = p_head_backend(ckpt)
+    use_lora = getattr(args, "vlm_q_lora", False)
+    validate_loss_scale(getattr(args, "vlm_vjp_loss_scale", 1.0))
+    validate_loss_scale(getattr(args, "vlm_q_loss_scale", 1.0))
+    if use_lora and backend != P_HEAD_BACKEND_QWEN:
+        raise ValueError("--vlm_q_lora currently requires a qwen_answer_state p checkpoint")
+    if use_lora and args.vlm_q_bootstrap_updates:
+        raise ValueError("LoRA q starts equal to p: set --vlm_q_bootstrap_updates 0")
 
     # The p head IS the definition of z, so it -- not a flag here -- decides
     # which VLM this run has to instantiate.
@@ -425,7 +441,8 @@ def setup_vlm_delta(judges, judge_model_names, args):
     temperature = float(args.vlm_head_temperature if args.vlm_head_temperature is not None
                         else ckpt["temperature"])
     heads = VLMDeltaHeads(p_head, temperature=temperature,
-                          ema_beta=args.vlm_q_ema_beta).cuda()
+                          ema_beta=args.vlm_q_ema_beta,
+                          use_ema=args.vlm_q_use_ema).cuda()
 
     # How many times q trains on any one generated sample.  A sample lives in the
     # buffer for buffer_size/global_batch steps and each update draws q_batch of
@@ -444,13 +461,25 @@ def setup_vlm_delta(judges, judge_model_names, args):
                         / max(1, global_batch))
 
     per_class_capacity = max(1, args.vlm_q_buffer_size // heads.num_classes)
-    buffer = ClassBalancedFeatureBuffer(
+    buffer = None if use_lora else ClassBalancedFeatureBuffer(
         heads.num_classes, heads.feature_dim, per_class_capacity,
         device="cuda", seed=args.seed + 7717)
 
-    q_optimizer = _build_q_optimizer(heads, args)
+    lora = None
+    if use_lora:
+        lora = LoRAQ(judge["vlm_extractor"], heads, rank=args.vlm_q_lora_rank,
+                     alpha=args.vlm_q_lora_alpha, scope=args.vlm_q_lora_scope,
+                     targets=args.vlm_q_lora_targets)
+        logger.info("[LoRA q] %d adapted modules, %d student adapter parameters; "
+                    "training on fresh scored images (feature replay/bootstrap and "
+                    "--vlm_q_batch_size do not apply). Config: %s",
+                    len(lora.layers), sum(p.numel() for p in lora.adapter_parameters()),
+                    lora.config)
+    q_optimizer = (_build_q_optimizer(heads, args) if lora is None
+                   else build_lora_optimizer(lora, args))
 
     judge["vlm_heads"] = heads
+    judge["vlm_lora"] = lora
     judge["vlm_buffer"] = buffer
     judge["vlm_q_optimizer"] = q_optimizer
     judge["vlm_class_map"] = class_map
@@ -469,25 +498,31 @@ def setup_vlm_delta(judges, judge_model_names, args):
         judge["name"], identity["vlm_model_name"], heads.num_classes,
         heads.feature_dim, temperature, args.vlm_delta_weight, args.vlm_q_lr,
         args.vlm_q_optimizer, args.vlm_q_updates_per_step, args.vlm_q_ema_beta,
-        per_class_capacity * heads.num_classes, per_class_capacity,
-        args.vlm_q_batch_size)
+        0 if lora is not None else per_class_capacity * heads.num_classes,
+        0 if lora is not None else per_class_capacity,
+        (min(args.batch_size, args.vlm_samples_per_step or args.batch_size)
+         * max(1, args.world_size)) if lora is not None else args.vlm_q_batch_size)
     logger.info("[VLM-delta] p head: %s (sha256 %s..., real val top-1 %s)",
                 args.vlm_p_head, identity["p_head_sha256"][:16],
                 judge["vlm_p_ckpt_meta"]["val_top1"])
-    logger.info(
-        "[VLM-delta] q sample reuse = q_batch(%d) * updates(%d) / global_batch(%d) "
-        "= %.2fx; q weight_decay=%.4g. Watch q_generalization_gap "
-        "(fresh-batch CE minus buffer CE): growing = q is memorising its replay "
-        "buffer and the injected field is noise on fresh samples.",
-        args.vlm_q_batch_size, args.vlm_q_updates_per_step, global_batch,
-        args.vlm_q_reuse, args.vlm_q_weight_decay)
-    if args.vlm_q_reuse > 2.0:
+    logger.info("[VLM-delta] generator q source: %s; q AdamW betas=(%g, %g)",
+                "EMA teacher" if heads.use_ema else "current student (no EMA)",
+                args.vlm_q_beta1, args.vlm_q_beta2)
+    if lora is None:
+        logger.info(
+            "[VLM-delta] q sample reuse = q_batch(%d) * updates(%d) / global_batch(%d) "
+            "= %.2fx; q weight_decay=%.4g. Watch q_generalization_gap "
+            "(fresh-batch CE minus buffer CE): growing = q is memorising its replay "
+            "buffer and the injected field is noise on fresh samples.",
+            args.vlm_q_batch_size, args.vlm_q_updates_per_step, global_batch,
+            args.vlm_q_reuse, args.vlm_q_weight_decay)
+    if lora is None and args.vlm_q_reuse > 2.0:
         logger.warning(
             "[VLM-delta] q sample reuse is %.1fx. Above ~2x the q head memorises "
             "its replay buffer instead of estimating q(c|z); set "
             "--vlm_q_batch_size to the global batch (%d) unless you mean to.",
             args.vlm_q_reuse, global_batch)
-    if args.vlm_q_batch_size < heads.num_classes / 2:
+    if lora is None and args.vlm_q_batch_size < heads.num_classes / 2:
         # Reuse and batch size trade off: reuse 1.0 pins the q batch to the
         # global batch, and if that is small relative to the number of classes
         # each CE step is dominated by a handful of samples, so q overfits them
@@ -501,7 +536,7 @@ def setup_vlm_delta(judges, judge_model_names, args):
             args.vlm_q_batch_size, heads.num_classes, args.vlm_q_reuse)
     logger.info(
         "[VLM-delta] objective is the SAMPLED-LABEL scalar "
-        "E[log q_teacher(c|z) - log p(c|z)] -- NOT the class-summed posterior KL "
+        "E[log q(c|z) - log p(c|z)] -- NOT the class-summed posterior KL "
         "and NOT a second -log p(c|z) driver. Calibrate on grad_ratio_vlm_fd "
         "(target sustained 0.22-0.30); the loss value is not comparable to "
         "anything.")
@@ -519,6 +554,7 @@ def _build_q_optimizer(heads, args):
                                momentum=args.vlm_q_momentum,
                                weight_decay=args.vlm_q_weight_decay)
     return torch.optim.AdamW(params, lr=args.vlm_q_lr,
+                             betas=(args.vlm_q_beta1, args.vlm_q_beta2),
                              weight_decay=args.vlm_q_weight_decay)
 
 
@@ -527,7 +563,7 @@ def _build_q_optimizer(heads, args):
 # ---------------------------------------------------------------------------
 
 def q_update_step(vlm_judge, z_detached, y_local, args, collect_metrics=False):
-    """Train ``q_student`` on detached generated features; then EMA the teacher.
+    """Train ``q_student`` on detached features; update EMA only when enabled.
 
     The generator receives no gradient (``z_detached``), the VLM receives no
     parameter gradient (it is frozen and outside this graph entirely) and the p
@@ -626,6 +662,49 @@ def _diag_images(sampled, selected):
     return images.detach()
 
 
+def training_judge_features(judge, images, *, microbatch=0, checkpoint_features=False):
+    """Bound FD activation memory while retaining gradients of the full batch.
+
+    Frozen judges are in eval mode, so images can be evaluated independently.
+    Non-reentrant checkpointing also supports the image-gradient diagnostics.
+    Bind the judge now: backward may recompute after the caller's judge loop.
+    """
+    if microbatch < 0:
+        raise ValueError("fd_feature_microbatch must be non-negative")
+    forward = partial(extract_judge_features, judge)
+    chunks = images.split(microbatch or images.shape[0])
+    features = []
+    for chunk in chunks:
+        if checkpoint_features and torch.is_grad_enabled() and chunk.requires_grad:
+            features.append(checkpoint(forward, chunk, use_reentrant=False))
+        else:
+            features.append(forward(chunk))
+    return torch.cat(features, dim=0)
+
+
+def training_generated_images(model, noise, labels, sampling_args, *,
+                              microbatch=0, checkpoint_generator=False):
+    """Checkpoint each generator microbatch to bound backward recomputation.
+
+    Concatenate images before computing any batch statistics or loss. This
+    keeps the full-batch objective and one generator optimizer step. Noise and
+    labels are sampled before splitting, and checkpointing preserves RNG state.
+    """
+    if microbatch < 0:
+        raise ValueError("generator_microbatch must be non-negative")
+    if noise.shape[0] != labels.shape[0]:
+        raise ValueError("generator noise and labels must have the same batch size")
+    size = microbatch or noise.shape[0]
+    images = []
+    for z, y in zip(noise.split(size), labels.split(size)):
+        if checkpoint_generator and torch.is_grad_enabled():
+            images.append(checkpoint(model.sample_images_with_grad, z, y,
+                                     sampling_args=sampling_args, use_reentrant=False))
+        else:
+            images.append(model.sample_images_with_grad(z, y, sampling_args=sampling_args))
+    return torch.cat(images, dim=0)
+
+
 def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
                       vlm_judge=None, probe=None):
     fid_norm_eps = args.fd_fid_norm_eps
@@ -635,6 +714,7 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
     delta_clamp = args.vlm_delta_clamp
     vlm_answer_state = (vlm_judge is not None
                         and vlm_judge.get("vlm_backend") == P_HEAD_BACKEND_QWEN)
+    lora = None if vlm_judge is None else vlm_judge.get("vlm_lora")
 
     train_class_ids = getattr(args, "train_class_ids", None)
     train_class_ids_tensor = (
@@ -654,8 +734,10 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
 
         z_noise = torch.randn(batch_size, *input_shape, device="cuda") * args.noise_scale
         y = _sample_labels()
-        sampled = model_wo_ddp.sample_images_with_grad(z_noise, y,
-                                                       sampling_args=sampling_args)
+        sampled = training_generated_images(
+            model_wo_ddp, z_noise, y, sampling_args,
+            microbatch=getattr(args, "generator_microbatch", 0),
+            checkpoint_generator=getattr(args, "grad_checkpointing", False))
         if tokenizer is not None:
             sampled = tokenizer.decode(tokenizer.denormalize_z(sampled))
         sampled = (sampled * 0.5 + 0.5).clamp(0, 1)  # [-1,1] -> [0,1]
@@ -663,7 +745,10 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
         loss = torch.tensor(0.0, device="cuda")
         loss_dict = {}
 
-        all_new_feats = [diff_all_gather(extract_judge_features(judge, sampled))
+        all_new_feats = [diff_all_gather(training_judge_features(
+                            judge, sampled,
+                            microbatch=getattr(args, "fd_feature_microbatch", 0),
+                            checkpoint_features=getattr(args, "fd_feature_checkpoint", False)))
                          for judge in judges]
 
         fd_term = torch.zeros((), device="cuda")
@@ -687,7 +772,7 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
         loss_dict["fd_loss_raw"] = fd_raw_sum
         loss_dict["fd_loss_norm"] = float(fd_term.detach())
 
-        # -- the conditional term: E[ log q_teacher(c|z) - log p(c|z) ] --
+        # -- the conditional term: E[ log q_generator(c|z) - log p(c|z) ] --
         vlm_term_loss = None
         z_vlm_detached, y_all, y_local, vlm_selected = None, None, None, None
         if vlm_judge is not None:
@@ -702,7 +787,15 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
                 # surrogate carries this rank's share of the global mean as its
                 # value and the term's exact image gradient as its derivative.
                 extractor = vlm_judge["vlm_extractor"]
-                if vlm_scale == 0.0:
+                if lora is not None:
+                    scored_global = (min(sampled.shape[0], extractor.max_samples_per_step
+                                         or sampled.shape[0])
+                                     * max(1, getattr(args, "world_size", 1)))
+                    vlm_surrogate, z_local, logq_local, vlm_selected = lora.generator_surrogate(
+                        sampled, class_map.to_local(y), denominator=scored_global,
+                        clamp=delta_clamp, loss_scale=args.vlm_vjp_loss_scale,
+                        need_grad=bool(vlm_scale != 0.0))
+                elif vlm_scale == 0.0:
                     # Warmup: the term contributes no gradient, so pay for the
                     # forward that feeds q and skip the 7B backward entirely.
                     with torch.no_grad():
@@ -739,7 +832,8 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
                         return d.sum() * delta_scale
 
                     vlm_surrogate, z_local, vlm_selected = extractor.vjp_surrogate(
-                        sampled, y_local_rank, _delta_term)
+                        sampled, y_local_rank, _delta_term,
+                        loss_scale=getattr(args, "vlm_vjp_loss_scale", 1.0))
                 loss_dict.update(extractor.last_stats)
                 # Every rank pushes the same all-gathered batch, so q stays
                 # bit-identical across ranks without a collective of its own.
@@ -747,11 +841,16 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
                 y_all = all_gather_plain(y.index_select(0, vlm_selected))
                 y_local = class_map.to_local(y_all)
                 logp_all = heads.p_log_probs(z)
-                logq_all = heads.q_teacher_log_probs(z)
+                logq_all = (heads.q_generator_log_probs(z) if lora is None
+                            else all_gather_plain(logq_local))
             else:
                 z = all_new_feats[vlm_judge["vlm_feat_index"]]
                 logp_all = heads.p_log_probs(z)
-                logq_all = heads.q_teacher_log_probs(z)
+                logq_all = heads.q_generator_log_probs(z)
+
+            # Preserve the actual scoring distribution for per-class diagnostics
+            # after the q optimizer changes the student later in this step.
+            vlm_judge["vlm_scored_logq"] = logq_all.detach()
 
             idx = y_local.view(-1, 1)
             logp_c = logp_all.gather(1, idx).squeeze(1)
@@ -801,7 +900,9 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
                     p_stats["vlm_p_target_rank_ratio_to_chance"] = (
                         p_stats["vlm_p_target_rank"] / ((n_cls + 1) / 2.0))
                     loss_dict.update(p_stats)
-                    loss_dict.update(head_metrics(lq, y_local, "vlm_q_teacher"))
+                    loss_dict.update(head_metrics(lq, y_local, "vlm_q_generator"))
+                    if heads.use_ema:
+                        loss_dict.update(head_metrics(lq, y_local, "vlm_q_teacher"))
                     loss_dict.update(pq_agreement_metrics(lp, lq, y_local))
                     loss_dict["vlm_chance_top1"] = 1.0 / heads.num_classes
                     loss_dict["vlm_chance_mean_rank"] = (heads.num_classes + 1) / 2.0
@@ -854,8 +955,9 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
             # -- label sensitivity: same noise, rolled labels --
             with torch.no_grad():
                 y_alt = torch.roll(y, 1, dims=0)
-                alt = model_wo_ddp.sample_images_with_grad(
-                    z_noise, y_alt, sampling_args=sampling_args)
+                alt = training_generated_images(
+                    model_wo_ddp, z_noise, y_alt, sampling_args,
+                    microbatch=getattr(args, "generator_microbatch", 0))
                 if tokenizer is not None:
                     alt = tokenizer.decode(tokenizer.denormalize_z(alt))
                 alt = (alt * 0.5 + 0.5).clamp(0, 1)
@@ -891,7 +993,7 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
                 tuple(f.detach() for f in all_new_feats),
                 z_vlm_detached,
                 None if y_local is None else y_local.detach(),
-                _diag_images(sampled, vlm_selected) if diag else None,
+                _diag_images(sampled, vlm_selected) if diag or lora is not None else None,
                 None if y_all is None else y_all.detach())
 
     return fd_train_step
@@ -917,6 +1019,8 @@ def initial_generated_diagnostics(vlm_judge, model, args, tokenizer=None, probe=
                        dtype=torch.long, device="cuda")
     model.eval()
     feats, labels, probe_hits, n_probe = [], [], 0.0, 0
+    lora = vlm_judge.get("vlm_lora")
+    student_logps, teacher_logps = [], []
     collected = 0
     while collected < n_target:
         bsz = min(args.fd_queue_fill_bsz, n_target - collected)
@@ -926,6 +1030,10 @@ def initial_generated_diagnostics(vlm_judge, model, args, tokenizer=None, probe=
         z = diff_all_gather(vlm_features_no_grad(vlm_judge, imgs, args)).detach()
         y_all = all_gather_plain(y)
         feats.append(z.float())
+        if lora is not None:
+            student_logps.append(all_gather_plain(lora.log_probs(imgs, "student", args.vlm_microbatch)))
+            if heads.use_ema:
+                teacher_logps.append(all_gather_plain(lora.log_probs(imgs, "teacher", args.vlm_microbatch)))
         labels.append(class_map.to_local(y_all))
         if probe is not None:
             probe_hits += float(probe_per_sample_correct(probe, imgs, y).sum())
@@ -935,10 +1043,12 @@ def initial_generated_diagnostics(vlm_judge, model, args, tokenizer=None, probe=
     y_local = torch.cat(labels)
 
     logp = heads.p_log_probs(z)
-    logq_s = heads.q_student_log_probs(z)
-    logq_t = heads.q_teacher_log_probs(z)
+    logq_s = heads.q_student_log_probs(z) if lora is None else torch.cat(student_logps)
+    logq_t = ((heads.q_teacher_log_probs(z) if lora is None else torch.cat(teacher_logps))
+              if heads.use_ema else None)
+    logq = logq_t if heads.use_ema else logq_s
     idx = y_local.view(-1, 1)
-    delta = (logq_t.gather(1, idx) - logp.gather(1, idx)).squeeze(1)
+    delta = (logq.gather(1, idx) - logp.gather(1, idx)).squeeze(1)
 
     report = {
         "num_samples": int(y_local.numel()),
@@ -948,11 +1058,20 @@ def initial_generated_diagnostics(vlm_judge, model, args, tokenizer=None, probe=
         "temperature": heads.temperature,
         "p": head_metrics(logp, y_local, "p"),
         "q_student": head_metrics(logq_s, y_local, "q_student"),
-        "q_teacher": head_metrics(logq_t, y_local, "q_teacher"),
-        "pq": pq_agreement_metrics(logp, logq_t, y_local, prefix="pq"),
+        "q_generator_source": "teacher" if heads.use_ema else "student",
+        "q_generator": head_metrics(logq, y_local, "q_generator"),
+        "pq": pq_agreement_metrics(logp, logq, y_local, prefix="pq"),
         "delta": delta_distribution_metrics(delta, prefix="delta_logqp"),
         "init_equality": heads.init_equality_check(z),
     }
+    if heads.use_ema:
+        report["q_teacher"] = head_metrics(logq_t, y_local, "q_teacher")
+    if lora is not None:
+        report["init_equality"].update({
+            "init_max_abs_logdiff_q_student_vs_p": float((logq_s - logp).abs().max()),
+        })
+        if heads.use_ema:
+            report["init_equality"]["init_max_abs_logdiff_q_teacher_vs_p"] = float((logq_t - logp).abs().max())
     if probe is not None and n_probe:
         report["probe_top1"] = probe_hits / n_probe
     return report
@@ -973,6 +1092,8 @@ def print_initial_diagnostics(report) -> None:
     ]
     for key, label in (("p", "p head"), ("q_student", "q student"),
                        ("q_teacher", "q teacher")):
+        if key not in report:
+            continue
         m = report[key]
         prefix = key
         lines += [
@@ -1002,10 +1123,13 @@ def print_initial_diagnostics(report) -> None:
         "",
         "q == p check (must be ~0 at initialisation):",
         f"  max |log q_student - log p|   {eq['init_max_abs_logdiff_q_student_vs_p']:.3e}",
-        f"  max |log q_teacher - log p|   {eq['init_max_abs_logdiff_q_teacher_vs_p']:.3e}",
         f"  max |W_q_student - W_p|       {eq['init_max_abs_weight_diff_q_student_vs_p']:.3e}",
-        f"  max |W_q_teacher - W_p|       {eq['init_max_abs_weight_diff_q_teacher_vs_p']:.3e}",
     ]
+    if "q_teacher" in report:
+        lines += [
+            f"  max |log q_teacher - log p|   {eq['init_max_abs_logdiff_q_teacher_vs_p']:.3e}",
+            f"  max |W_q_teacher - W_p|       {eq['init_max_abs_weight_diff_q_teacher_vs_p']:.3e}",
+        ]
     if "probe_top1" in report:
         lines += ["",
                   f"held-out probe top1  {report['probe_top1']:.4f}"
@@ -1026,6 +1150,9 @@ def print_initial_diagnostics(report) -> None:
 # ---------------------------------------------------------------------------
 
 def train_and_evaluate(args):
+    if args.vlm_disable_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     args.train_class_ids = validate_train_class_ids(
         getattr(args, "train_class_ids", None), args.num_classes)
     validate_vlm_takeoff_gate_args(args)
@@ -1093,6 +1220,8 @@ def train_and_evaluate(args):
     heads = vlm_judge["vlm_heads"]
     buffer = vlm_judge["vlm_buffer"]
 
+    lora = vlm_judge.get("vlm_lora")
+
     fd_restored = (extra is not None and "fd_queue_states" in extra
                    and load_fd_queue_states(judges, extra["fd_queue_states"]))
     vlm_restored = False
@@ -1106,27 +1235,32 @@ def train_and_evaluate(args):
             raise ValueError(
                 "refusing to resume: the checkpoint was written with a different "
                 f"p head / VLM configuration. Differences (saved, current): {diffs}")
+        if (state.get("q_lora") is not None) != (lora is not None):
+            raise ValueError("Cannot resume across linear-only and LoRA q modes; start a new run with --load_from")
+        if lora is not None:
+            lora.load_state_dict(state["q_lora"])
         heads.load_q_state_dict(state["q"])
         heads.cuda()
-        vlm_judge["vlm_q_optimizer"] = _build_q_optimizer(heads, args)
+        vlm_judge["vlm_q_optimizer"] = (_build_q_optimizer(heads, args) if lora is None
+                                        else build_lora_optimizer(lora, args))
         if state.get("q_optimizer") is not None:
-            vlm_judge["vlm_q_optimizer"].load_state_dict(state["q_optimizer"])
-        if state.get("q_buffer") is not None:
+            load_q_optimizer_state(vlm_judge["vlm_q_optimizer"], state["q_optimizer"])
+        if buffer is not None and state.get("q_buffer") is not None:
             buffer.load_state_dict(state["q_buffer"])
         vlm_restored = True
         logger.info("[VLM-delta] Restored q student/teacher (%d q steps), optimizer "
                     "and replay buffer (%d entries) from checkpoint",
-                    int(heads.q_train_steps.item()), buffer.size)
+                    int(heads.q_train_steps.item()), 0 if buffer is None else buffer.size)
 
     def _collect(judge_name, feats, labels):
-        if judge_name != vlm_judge["name"]:
+        if buffer is None or judge_name != vlm_judge["name"]:
             return
         buffer.push(feats.float(), vlm_judge["vlm_class_map"].to_local(labels))
 
     if fd_restored:
         logger.info("[FD] Restored all queue states from checkpoint — skipping queue fill")
         run_sanity_check(judges, args.queue_size, args=args)
-        if not vlm_restored and args.vlm_q_bootstrap > 0:
+        if buffer is not None and not vlm_restored and args.vlm_q_bootstrap > 0:
             logger.info("[VLM-delta] No saved q state — running a standalone "
                         "buffer bootstrap pass")
             bootstrap_vlm_buffer(vlm_judge, model_wo_ddp, args, tokenizer=tokenizer)
@@ -1136,7 +1270,7 @@ def train_and_evaluate(args):
         fill_all_queues(judges, model_wo_ddp, args, tokenizer=tokenizer,
                         feature_collector=None if vlm_restored else _collect)
         run_sanity_check(judges, args.queue_size, args=args)
-    if (not vlm_restored and buffer.size == 0 and args.vlm_q_bootstrap > 0
+    if (buffer is not None and not vlm_restored and buffer.size == 0 and args.vlm_q_bootstrap > 0
             and vlm_judge.get("vlm_backend") == P_HEAD_BACKEND_QWEN):
         # The answer-state extractor is not one of the FD judges, so the queue
         # fill produced none of its features and the replay buffer is still
@@ -1146,7 +1280,7 @@ def train_and_evaluate(args):
                     "(~%.0f min at 46 img/s)", args.vlm_q_bootstrap,
                     args.vlm_q_bootstrap / 46.0 / 60.0)
         bootstrap_vlm_buffer(vlm_judge, model_wo_ddp, args, tokenizer=tokenizer)
-    if not vlm_restored:
+    if not vlm_restored and buffer is not None:
         logger.info("[VLM-delta] q replay buffer seeded: %s",
                     ", ".join(f"{k}={v:g}" for k, v in buffer.stats().items()))
 
@@ -1190,8 +1324,9 @@ def train_and_evaluate(args):
             print_initial_diagnostics(report)
             logger.info("[VLM-delta] wrote %s", path)
         eq = report["init_equality"]
-        worst = max(eq["init_max_abs_logdiff_q_student_vs_p"],
-                    eq["init_max_abs_logdiff_q_teacher_vs_p"])
+        worst = eq["init_max_abs_logdiff_q_student_vs_p"]
+        if heads.use_ema:
+            worst = max(worst, eq["init_max_abs_logdiff_q_teacher_vs_p"])
         if not vlm_restored and args.vlm_q_bootstrap_updates == 0 and worst > 1e-4:
             raise RuntimeError(
                 f"q was expected to equal p at initialisation but max |log q - log p| "
@@ -1232,6 +1367,7 @@ def train_and_evaluate(args):
     ckpt_timer_start = time.perf_counter()
     ckpt_timer_step = args.current_step
     last_ckpt_step = args.current_step
+    last_ckpt_time = time.perf_counter()
 
     metric_file = os.path.join(args.log_dir, "training_metrics.json")
     metric_logger = MetricLogger(delimiter="  ", output_file=metric_file, prefetch=True)
@@ -1254,6 +1390,8 @@ def train_and_evaluate(args):
     # rather than hide it in a median, and the drift meters are monotone.
     instant_meters = list(INSTANT_METERS) + list(
         BACKEND_INSTANT_METERS.get(vlm_judge.get("vlm_backend"), ()))
+    if not heads.use_ema:
+        instant_meters = [name for name in instant_meters if not name.startswith("q_teacher_")]
     for name in instant_meters:
         metric_logger.add_meter(name, SmoothedValue(1, "{value:.6f}"))
     first_step_of_process = args.current_step
@@ -1300,9 +1438,16 @@ def train_and_evaluate(args):
         for i, judge in enumerate(judges):
             judge["queue"].enqueue(new_feats[i])
 
-        # -- q student update on detached generated features, then EMA teacher --
-        loss_dict.update(q_update_step(vlm_judge, z_vlm, y_local, args,
-                                       collect_metrics=diag))
+        # -- q student update; optional EMA for the legacy comparison --
+        if lora is None:
+            loss_dict.update(q_update_step(vlm_judge, z_vlm, y_local, args,
+                                           collect_metrics=diag))
+        else:
+            n_local = sampled_detached.shape[0]
+            local_labels = y_local[args.rank * n_local:(args.rank + 1) * n_local]
+            loss_dict.update(q_lora_update_step(
+                lora, vlm_judge["vlm_q_optimizer"], sampled_detached, local_labels,
+                args, collect_metrics=diag))
 
         torch.cuda.synchronize()
 
@@ -1358,7 +1503,7 @@ def train_and_evaluate(args):
                 per_class.update(
                     y_local,
                     logp_all=heads.p_log_probs(z_vlm),
-                    logq_all=heads.q_teacher_log_probs(z_vlm),
+                    logq_all=vlm_judge["vlm_scored_logq"],
                     probe_correct=probe_correct)
         if (args.vlm_per_class_every > 0 and step > 0
                 and step % args.vlm_per_class_every == 0
@@ -1426,8 +1571,9 @@ def train_and_evaluate(args):
             fd_extra = {"fd_queue_states": save_fd_queue_states(judges)} if judges else {}
             fd_extra["vlm_delta_state"] = {
                 "q": heads.q_state_dict(),
+                "q_lora": None if lora is None else lora.state_dict(),
                 "q_optimizer": vlm_judge["vlm_q_optimizer"].state_dict(),
-                "q_buffer": (buffer.state_dict() if args.vlm_q_checkpoint_buffer
+                "q_buffer": (buffer.state_dict() if buffer is not None and args.vlm_q_checkpoint_buffer
                              else None),
                 "p_identity": vlm_judge["vlm_p_identity"],
                 "p_head_path": vlm_judge["vlm_p_ckpt_meta"]["path"],
@@ -1452,10 +1598,18 @@ def train_and_evaluate(args):
             _save(saver=None)
             return 4
 
-        if (args.current_step - last_ckpt_step >= args.save_every
-                or args.current_step == args.total_steps):
+        # A slow FP32 VLM run can take hours to reach the first 1,000-step
+        # cadence estimate. Honor the wall-clock target from the first step.
+        # Rank zero decides so all ranks enter checkpoint collectives together.
+        save_due = broadcast_bool(
+            (ckpt_target_minutes > 0
+             and time.perf_counter() - last_ckpt_time >= ckpt_target_minutes * 60)
+            or args.current_step - last_ckpt_step >= args.save_every
+            or args.current_step == args.total_steps)
+        if save_due:
             _save()
             last_ckpt_step = args.current_step
+            last_ckpt_time = time.perf_counter()
         if args.milestone_every > 0 and step > 0 and step % args.milestone_every == 0:
             _save()
 
@@ -1529,8 +1683,8 @@ def _q_bootstrap_train(vlm_judge, args):
     * ``log q - log p`` is NOT zero at step 0, so the initial-equality assertion
       is skipped and ``grad_ratio_vlm_fd`` is readable from the first step
       instead of having to grow with q's drift.
-    * the EMA teacher is NOT synced to the student at the end, and must not be.
-      Measured on this arm's own replay buffer (20,000 base-model generations,
+    * With --vlm_q_use_ema, the teacher is not synced to the student at the end.
+      Historical EMA-run measurements on the replay buffer (20,000 base-model generations,
       lr 1e-3, wd 3.0, held-out 20%):
 
           updates   student CE / entropy   EMA teacher CE / entropy
@@ -1549,7 +1703,7 @@ def _q_bootstrap_train(vlm_judge, args):
       draw -- which is exactly what it looked like when it was tried: q_teacher
       read CE 6.81 / entropy 3.37 on fresh generations instead of ~4.70 / ~4.52.
     """
-    if 0 < args.vlm_q_bootstrap_updates < 2000:
+    if vlm_judge["vlm_heads"].use_ema and 0 < args.vlm_q_bootstrap_updates < 2000:
         logger.warning(
             "[VLM-delta] --vlm_q_bootstrap_updates=%d is below the ~2000 the EMA "
             "teacher needs to average out the student's noise (beta=%.4f). The "
@@ -1560,6 +1714,7 @@ def _q_bootstrap_train(vlm_judge, args):
     buffer = vlm_judge["vlm_buffer"]
     optimizer = vlm_judge["vlm_q_optimizer"]
     trajectory = []
+    active_q = "q_teacher" if heads.use_ema else "q_student"
     done = 0
     for i in range(args.vlm_q_bootstrap_updates):
         batch = buffer.sample(args.vlm_q_batch_size)
@@ -1586,34 +1741,32 @@ def _q_bootstrap_train(vlm_judge, args):
         if i % 500 == 0 or i == args.vlm_q_bootstrap_updates - 1:
             drift = heads.drift_metrics()
             with torch.no_grad():
-                t_lp = heads.q_teacher_log_probs(z_batch)
+                t_lp = heads.q_generator_log_probs(z_batch)
                 t_ent = float(-(t_lp.exp() * t_lp).sum(-1).mean())
                 t_ce = float(F.nll_loss(t_lp, y_batch))
             trajectory.append({
                 "update": i, "student_batch_ce": float(loss.detach()),
-                "teacher_batch_ce": t_ce, "teacher_entropy": t_ent,
+                "generator_q_batch_ce": t_ce, "generator_q_entropy": t_ent,
                 "q_student_drift_from_p": drift["q_student_weight_delta_rel"],
-                "q_teacher_drift_from_p": drift["q_teacher_weight_delta_rel"]})
+                "q_generator_drift_from_p": drift[f"{active_q}_weight_delta_rel"]})
             logger.info(
-                "[VLM-delta] q bootstrap %5d/%d  student_ce=%.4f  teacher_ce=%.4f  "
-                "teacher_entropy=%.4f (uniform %.4f)  drift s=%.3f t=%.3f",
+                "[VLM-delta] q bootstrap %5d/%d  student_ce=%.4f  generator_q_ce=%.4f  "
+                "generator_q_entropy=%.4f (uniform %.4f)  drift student=%.3f active=%.3f",
                 i, args.vlm_q_bootstrap_updates, float(loss.detach()), t_ce, t_ent,
                 math.log(heads.num_classes), drift["q_student_weight_delta_rel"],
-                drift["q_teacher_weight_delta_rel"])
+                drift[f"{active_q}_weight_delta_rel"])
 
     after = heads.drift_metrics()
     logger.info(
-        "[VLM-delta] q bootstrap done: %d updates. Drift from p: student %.4f, "
-        "teacher %.4f (relative ||W||). The generator reads the TEACHER, which is "
-        "the noise-averaged head; the student stays overconfident by design. "
-        "Uniform CE for %d classes is %.4f -- check q_teacher_ce in the init "
-        "diagnostics lands near it, NOT the student's.",
-        done, after["q_student_weight_delta_rel"], after["q_teacher_weight_delta_rel"],
+        "[VLM-delta] q bootstrap done: %d updates. Generator reads %s. "
+        "Student drift %.4f, active q drift %.4f (relative ||W||). "
+        "Uniform CE for %d classes is %.4f.",
+        done, active_q, after["q_student_weight_delta_rel"], after[f"{active_q}_weight_delta_rel"],
         heads.num_classes, math.log(heads.num_classes))
     return {"updates": done, "trajectory": trajectory,
             "uniform_ce": math.log(heads.num_classes),
             "q_student_drift_from_p": after["q_student_weight_delta_rel"],
-            "q_teacher_drift_from_p": after["q_teacher_weight_delta_rel"]}
+            "q_generator_drift_from_p": after[f"{active_q}_weight_delta_rel"]}
 
 
 # ---------------------------------------------------------------------------
@@ -1629,6 +1782,9 @@ def get_args_parser():
     parser.add_argument("--epochs", default=200, type=int)
     parser.add_argument("--steps_per_epoch", default=1250, type=int)
     parser.add_argument("--batch_size", default=32, type=int, help="batch size per GPU")
+    parser.add_argument("--generator_microbatch", default=0, type=int,
+                        help="images per generator forward/recomputation; 0 uses the full "
+                             "local batch; combine with --grad_checkpointing to bound VRAM")
     parser.add_argument("--noise_scale", type=float, default=1.0)
     parser.add_argument("--same_noise", action="store_true")
 
@@ -1751,6 +1907,10 @@ def get_args_parser():
     parser.add_argument("--queue_size", type=int, default=50000)
     parser.add_argument("--fd_fid_norm_eps", type=float, default=0.01)
     parser.add_argument("--fd_queue_fill_bsz", type=int, default=256)
+    parser.add_argument("--fd_feature_microbatch", type=int, default=0,
+                        help="FD feature images per forward; 0 uses the full local batch")
+    parser.add_argument("--fd_feature_checkpoint", action="store_true",
+                        help="recompute FD features in backward to save activation memory")
     parser.add_argument("--fd_repr_models", type=str, nargs="+", default=["inception"])
     parser.add_argument("--fd_repr_stats_paths", type=str, nargs="+", default=None)
     parser.add_argument("--fd_repr_weights", type=float, nargs="+", default=None)
@@ -1768,7 +1928,7 @@ def get_args_parser():
                        help="short name of the FD judge carrying the VLM (e.g. 'siglip'); "
                             "its features are reused so the term costs no extra forward")
     group.add_argument("--vlm_delta_weight", type=float, default=0.0,
-                       help="lambda on E[log q_teacher(c|z) - log p(c|z)]. Calibrate on "
+                       help="lambda on E[log q(c|z) - log p(c|z)]. Calibrate on "
                             "grad_ratio_vlm_fd (target sustained 0.22-0.30), never on "
                             "the loss value. NOTE the term is exactly 0 at init because "
                             "q == p, so the calibration window must be long enough for "
@@ -1788,8 +1948,28 @@ def get_args_parser():
                        help="abort after this many consecutive non-finite generator "
                             "gradients")
 
-    group.add_argument("--vlm_q_lr", type=float, default=1e-3)
+    group.add_argument("--vlm_q_lr", type=float, default=1e-4)
+    group.add_argument("--vlm_q_lora", action="store_true",
+                       help="Qwen only: train student LoRA plus q head on fresh detached images")
+    group.add_argument("--vlm_q_lora_rank", type=int, default=8)
+    group.add_argument("--vlm_q_lora_alpha", type=float, default=16.0)
+    group.add_argument("--vlm_q_lora_scope", choices=("language", "vision", "both"), default="both")
+    group.add_argument("--vlm_q_lora_targets", nargs="+",
+                       default=["q_proj", "k_proj", "v_proj", "o_proj", "qkv", "proj"],
+                       help="Linear-module leaf names; only vision / pre-answer decoder layers are eligible")
+    group.add_argument("--vlm_q_lora_lr", type=float, default=1e-5)
+    group.add_argument("--vlm_q_lora_weight_decay", type=float, default=0.01)
+    group.add_argument("--vlm_vjp_loss_scale", type=float, default=1.0,
+                       help="Qwen image-VJP backward scale; unscaled in FP32 before injection; leaves lambda unchanged")
+    group.add_argument("--vlm_q_loss_scale", type=float, default=1.0,
+                       help="LoRA q CE backward scale; unscaled before gradient averaging/clipping/optimizer")
+    group.add_argument("--vlm_disable_tf32", action="store_true",
+                       help="disable CUDA matmul and cuDNN TF32 process-wide for precision comparisons")
     group.add_argument("--vlm_q_optimizer", choices=("adamw", "sgd"), default="adamw")
+    group.add_argument("--vlm_q_beta1", type=float, default=0.0,
+                       help="q AdamW beta1, shared by head and LoRA parameter groups")
+    group.add_argument("--vlm_q_beta2", type=float, default=0.999,
+                       help="q AdamW beta2, shared by head and LoRA parameter groups")
     group.add_argument("--vlm_q_momentum", type=float, default=0.9)
     group.add_argument("--vlm_q_weight_decay", type=float, default=3.0,
                        help="AdamW decoupled weight decay on the q head. NOT "
@@ -1809,9 +1989,10 @@ def get_args_parser():
                             "per-sample reuse factor 1.0 -- above ~2x the head "
                             "memorises the buffer and q(c|z) becomes noise on the "
                             "fresh samples the generator loss evaluates it at")
+    group.add_argument("--vlm_q_use_ema", action="store_true",
+                       help="opt in to the old EMA q teacher; default uses current student directly")
     group.add_argument("--vlm_q_ema_beta", type=float, default=0.999,
-                       help="EMA decay of the q teacher the GENERATOR sees. The teacher "
-                            "must move slower than the student")
+                       help="q teacher EMA decay, only used with --vlm_q_use_ema")
     group.add_argument("--vlm_q_buffer_size", type=int, default=20000,
                        help="total replay-buffer capacity; split evenly per class")
     group.add_argument("--vlm_q_bootstrap", type=int, default=50000,

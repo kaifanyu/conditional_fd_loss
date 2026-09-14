@@ -2,6 +2,14 @@
 
 **Status: implemented and validated 2026-08-28; one trial, at 100 classes.**
 
+For the opt-in Qwen LoRA q extension, fresh-image updates, precision controls,
+and pseudocode, see [Learnable Qwen q with LoRA](vlm_lora_q.md).
+
+**2026-09-09 update:** the entry point and launcher now default to direct student
+q, head LR=1e-4, and AdamW betas=(0.0, 0.999), with one q update per generator
+step. The EMA trial described below is available through `--vlm_q_use_ema`
+(`Q_USE_EMA=1` in the launcher); it is no longer the training default.
+
 A single new experiment. It does not touch, re-run or reinterpret the fitted-GMM
 work in [`docs/gmm.md`](gmm.md) — that code path is unchanged and its tests still
 pass.
@@ -180,7 +188,7 @@ checks that against the direct computation **in fp32**, where it agrees to
 `cos > 0.9999` and five decimal places regardless of microbatch size. The
 detached `z` from that same forward feeds the `q` replay buffer for free.
 
-### 3.3 Reduced precision: the forward is safe, the image gradient is not
+### 3.3 Reduced precision: similar features, different image gradients
 
 Measured on real ImageNet val images at 256 px, against an fp32 reference:
 
@@ -191,19 +199,20 @@ Measured on real ImageNet val images at 256 px, against an fp32 reference:
 | image gradient (cosine) | **0.03** | −0.48 |
 | image gradient magnitude ratio | 1.05 | 5.07 |
 
-The forward is faithful, so the frozen `p` head — which only ever sees `z` — is
-unaffected, and features cached in bf16 are as good as fp32 ones. The **image
-gradient** is not: rounding the weights to 7 mantissa bits rotates it almost
-completely, and fp16 is worse (its magnitude is 5× too large, the classic
-un-loss-scaled backward). This is not an implementation defect — the surrogate is
-exact in fp32 — but a statement about how ill-conditioned `∂z/∂x` is through a
-28-layer decoder. Two consequences:
+These measurements show similar feature directions but substantially different
+image-gradient directions. They do not establish identical p-head predictions
+or identify the source of error: weight/activation/backward rounding,
+cancellation, and fp16 underflow or overflow need controlled comparisons.
+In particular, a 5× gradient magnitude does not diagnose an unscaled backward.
+The surrogate's fp32 equivalence tests validate its gradient wiring within a
+fixed precision setting.
 
-* a bf16 run is following the gradient of the *bf16-rounded model*, which is
-  self-consistent (repeat calls agree to `cos = 0.99998`) but is not the fp32
-  model's gradient;
-* fp32 costs ~37 GB and ~3.5× the time, which does not fit alongside the FD
-  judges at any useful batch.
+Repeated bf16 calls were self-consistent (`cos = 0.99998`), which establishes
+repeatability rather than agreement with fp32. Historical fp32 measurements
+were ~37 GB and ~3.5× slower for their tested setup; measure memory again at a
+smaller microbatch before concluding it cannot fit. The new
+[precision sweep](vlm_lora_q.md#precision-and-loss-scaling) compares fixed
+inputs and separate p/q/delta gradients at multiple loss scales, with TF32 off.
 
 Nothing here says the bf16 gradient carries no signal — what is measured is
 per-sample direction agreement between two models, not the expectation over

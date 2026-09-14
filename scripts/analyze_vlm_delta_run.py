@@ -8,7 +8,7 @@ prints the trajectory that decides whether the sampled-label
 The three columns to read together are
 
     vlm_p_top1        the frozen real-data VLM head's view of the sampled label
-    vlm_q_teacher_top1 the online generator-side head the loss actually uses
+    vlm_q_generator_top1 the online generator-side head the loss actually uses
     probe_top1        the held-out ResNet-50, never in the loss -- the arbiter
 
 ``vlm_*`` rising while ``probe_top1`` stays at chance is VLM-space exploitation,
@@ -41,12 +41,12 @@ TRAJECTORY = [
     ("vlm_p_top1", "p_t1", 8),
     ("vlm_p_target_rank", "p_rank", 8),
     ("vlm_p_target_logp", "p_logp", 8),
-    ("vlm_q_teacher_top1", "qT_t1", 8),
-    ("vlm_q_teacher_target_rank", "qT_rank", 8),
-    ("vlm_q_teacher_target_logp", "qT_logp", 8),
+    ("vlm_q_generator_top1", "q_t1", 8),
+    ("vlm_q_generator_target_rank", "q_rank", 8),
+    ("vlm_q_generator_target_logp", "q_logp", 8),
     ("vlm_delta_logqp", "dlt_qp", 8),
     ("vlm_pq_full_kl_qp", "KL(q|p)", 8),
-    ("q_teacher_weight_delta_l2", "qT_drft", 8),
+    ("q_generator_weight_delta_l2", "q_drft", 8),
     ("grad_ratio_vlm_fd", "g_ratio", 8),
     ("cos_update_fd_vlm", "cos", 9),
 ]
@@ -65,13 +65,13 @@ SUMMARY_KEYS = [
     ("vlm_logq_c", "log q(c|z)"),
     ("vlm_p_top1", "p top1"),
     ("vlm_p_target_rank", "p rank"),
-    ("vlm_q_teacher_top1", "q_teacher top1"),
-    ("vlm_q_teacher_target_rank", "q_teacher rank"),
+    ("vlm_q_generator_top1", "generator q top1"),
+    ("vlm_q_generator_target_rank", "generator q rank"),
     ("vlm_q_student_top1_pre", "q_student t1 fresh"),
     ("vlm_q_student_ce_pre", "q_student ce fresh"),
     ("vlm_pq_full_kl_qp", "KL(q||p)"),
     ("vlm_pq_top1_agreement", "p/q top1 agree"),
-    ("q_teacher_weight_delta_l2", "q_teacher drift"),
+    ("q_generator_weight_delta_l2", "generator q drift"),
     ("q_student_weight_delta_l2", "q_student drift"),
     ("q_teacher_student_kl", "KL(stud||teach)"),
     ("q_train_accuracy", "q train acc"),
@@ -97,7 +97,19 @@ def load_metrics(path):
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
+                # Current runs identify the scoring q explicitly. Older logs
+                # always used the teacher; direct-q drift comes from the student.
+                for suffix in ("top1", "target_rank", "target_logp"):
+                    key = "vlm_q_generator_" + suffix
+                    if key not in row and "vlm_q_teacher_" + suffix in row:
+                        row[key] = row["vlm_q_teacher_" + suffix]
+                for suffix in ("weight_delta_l2", "weight_delta_rel", "weight_cos_to_p"):
+                    key = "q_generator_" + suffix
+                    source = "q_teacher_" + suffix if "q_teacher_" + suffix in row else "q_student_" + suffix
+                    if key not in row and source in row:
+                        row[key] = row[source]
+                rows.append(row)
             except json.JSONDecodeError:
                 continue  # partially flushed final line on a live run
     return rows
@@ -218,8 +230,8 @@ def print_milestones(rows, num_classes):
         ("probe_rank < 0.9x chance", rank("probe_rank")),
         ("vlm_p_top1 > 3x chance", t1("vlm_p_top1")),
         ("vlm_p_target_rank < 0.9x chance", rank("vlm_p_target_rank")),
-        ("vlm_q_teacher_top1 > 3x chance", t1("vlm_q_teacher_top1")),
-        ("vlm_q_teacher_target_rank < 0.9x chance", rank("vlm_q_teacher_target_rank")),
+        ("vlm_q_generator_top1 > 3x chance", t1("vlm_q_generator_top1")),
+        ("vlm_q_generator_target_rank < 0.9x chance", rank("vlm_q_generator_target_rank")),
         # the _pre read is the honest one: that batch has not entered the
         # replay buffer yet, so the student cannot have trained on it
         ("vlm_q_student_top1_pre > 3x chance (fresh batch)",
@@ -291,17 +303,16 @@ def print_diagnosis(rows, num_classes, window):
             print(f"    tails                p10 {p10_last:.4f}{min_txt}, "
                   f"|delta| p99 {p99_last:.4f}{note}")
 
-    drift_t, drift_s = med("q_teacher_weight_delta_l2", lo), med("q_student_weight_delta_l2", lo)
-    cos_t = med("q_teacher_weight_cos_to_p", lo)
+    drift_t, drift_s = med("q_generator_weight_delta_l2", lo), med("q_student_weight_delta_l2", lo)
+    cos_t = med("q_generator_weight_cos_to_p", lo)
     if drift_t is not None:
-        rel = med("q_teacher_weight_delta_rel", lo)
-        note = ("q has NOT moved from p -- the term is inert" if drift_t < 1e-3 else
-                "q is tracking" if drift_s is None or drift_t <= drift_s else
-                "TEACHER AHEAD OF STUDENT -- check the EMA")
+        rel = med("q_generator_weight_delta_rel", lo)
+        note = ("q head is near p; inspect LoRA drift too" if drift_t < 1e-3 else
+                "q head has moved from p")
         rel_txt = "" if rel is None else f" ({rel:.1%} of ||W_p||)"
         student_txt = "n/a" if drift_s is None else f"{drift_s:.4f}"
-        cos_txt = "" if cos_t is None else f", teacher cos_to_p {cos_t:.4f}"
-        print(f"    q drift from p       teacher {drift_t:.4f}{rel_txt}, "
+        cos_txt = "" if cos_t is None else f", generator q cos_to_p {cos_t:.4f}"
+        print(f"    q drift from p       generator q {drift_t:.4f}{rel_txt}, "
               f"student {student_txt}{cos_txt}  -- {note}")
 
     gap = med("q_generalization_gap", lo)

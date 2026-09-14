@@ -1,0 +1,10 @@
+Captured by read-only sacct query for job 547202, including duplicate allocation records.
+Command: sacct -j 547202 --duplicates --format=JobID,JobName%24,State,ExitCode,Elapsed,Start,End,NodeList%35,AllocTRES%70 -P
+
+JobID|JobName|State|ExitCode|Elapsed|Start|End|NodeList|AllocTRES
+547202|qwen-lora-q-cal|PREEMPTED|0:0|04:30:51|2026-09-09T14:29:49|2026-09-09T19:00:40|enough-oryx.grasp.maas|billing=32,cpu=32,gres/gpu=4,mem=256G,node=1
+547202.batch|batch|CANCELLED|0:15|04:30:54|2026-09-09T14:29:49|2026-09-09T19:00:43|enough-oryx.grasp.maas|cpu=32,gres/gpu=4,mem=256G,node=1
+547202.extern|extern|COMPLETED|0:0|04:30:55|2026-09-09T14:29:49|2026-09-09T19:00:44|enough-oryx.grasp.maas|billing=32,cpu=32,gres/gpu=4,mem=256G,node=1
+547202|qwen-lora-q-cal|COMPLETED|0:0|15:56:53|2026-09-09T19:03:06|2026-09-10T10:59:59|al-l40s-0.grasp.maas|billing=32,cpu=32,gres/gpu=4,mem=256G,node=1
+547202.batch|batch|COMPLETED|0:0|15:56:53|2026-09-09T19:03:06|2026-09-10T10:59:59|al-l40s-0.grasp.maas|cpu=32,gres/gpu=4,mem=256G,node=1
+547202.extern|extern|COMPLETED|0:0|15:56:53|2026-09-09T19:03:06|2026-09-10T10:59:59|al-l40s-0.grasp.maas|billing=32,cpu=32,gres/gpu=4,mem=256G,node=1

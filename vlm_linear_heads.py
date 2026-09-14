@@ -116,15 +116,22 @@ class VLMLinearHead(torch.nn.Module):
 
     # -- forward --------------------------------------------------------------
 
-    def logits(self, z: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    def logits(self, z: torch.Tensor, temperature: float = 1.0, *,
+               detach_parameters: bool = False) -> torch.Tensor:
         if z.ndim != 2 or z.shape[1] != self.feature_dim:
             raise ValueError(
                 f"expected features shaped (B, {self.feature_dim}), got {tuple(z.shape)}"
             )
-        return self.linear(self.normalize(z)) / float(temperature)
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            if detach_parameters:
+                return F.linear(self.normalize(z), self.weight.detach(),
+                                self.bias.detach()) / float(temperature)
+            return self.linear(self.normalize(z)) / float(temperature)
 
-    def log_probs(self, z: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
-        return torch.log_softmax(self.logits(z, temperature), dim=-1)
+    def log_probs(self, z: torch.Tensor, temperature: float = 1.0, *,
+                  detach_parameters: bool = False) -> torch.Tensor:
+        return torch.log_softmax(self.logits(z, temperature,
+                                 detach_parameters=detach_parameters), dim=-1)
 
     def forward(self, z: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
         return self.logits(z, temperature)
@@ -308,7 +315,7 @@ class VLMDeltaHeads(torch.nn.Module):
     """
 
     def __init__(self, p_head: VLMLinearHead, *, temperature: float = 1.0,
-                 ema_beta: float = 0.999) -> None:
+                 ema_beta: float = 0.999, use_ema: bool = True) -> None:
         super().__init__()
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError(f"temperature must be finite and > 0, got {temperature}")
@@ -316,6 +323,9 @@ class VLMDeltaHeads(torch.nn.Module):
             raise ValueError(f"ema_beta must be in [0, 1), got {ema_beta}")
         self.temperature = float(temperature)
         self.ema_beta = float(ema_beta)
+        # Keep the library default compatible with older analysis utilities;
+        # the training entry point explicitly defaults use_ema to False.
+        self.use_ema = bool(use_ema)
 
         self.p_head = p_head
         self.p_head.eval().requires_grad_(False)
@@ -356,14 +366,22 @@ class VLMDeltaHeads(torch.nn.Module):
     def q_teacher_log_probs(self, z: torch.Tensor) -> torch.Tensor:
         return self.q_teacher.log_probs(z, self.temperature)
 
+    @property
+    def generator_head(self) -> VLMLinearHead:
+        return self.q_teacher if self.use_ema else self.q_student
+
+    def q_generator_log_probs(self, z: torch.Tensor) -> torch.Tensor:
+        """Read the selected q with fixed weights, retaining the image/feature VJP."""
+        return self.generator_head.log_probs(z, self.temperature, detach_parameters=True)
+
     def delta_log_qp(self, z: torch.Tensor, labels: torch.Tensor
                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Per-sample ``log q_teacher(c|z) - log p(c|z)`` and its two halves.
+        """Per-sample ``log q_generator(c|z) - log p(c|z)`` and its two halves.
 
         Differentiable in ``z``; both heads' parameters are frozen here.
         """
         logp_all = self.p_log_probs(z)
-        logq_all = self.q_teacher_log_probs(z)
+        logq_all = self.q_generator_log_probs(z)
         idx = labels.long().view(-1, 1)
         logp_c = logp_all.gather(1, idx).squeeze(1)
         logq_c = logq_all.gather(1, idx).squeeze(1)
@@ -374,6 +392,8 @@ class VLMDeltaHeads(torch.nn.Module):
     @torch.no_grad()
     def ema_update(self) -> None:
         """``psi_teacher <- beta * psi_teacher + (1 - beta) * psi_student``."""
+        if not self.use_ema:
+            return
         beta = self.ema_beta
         total_sq = 0.0
         for teacher_p, student_p in zip(self.q_teacher.linear.parameters(),
@@ -426,11 +446,14 @@ class VLMDeltaHeads(torch.nn.Module):
         out["q_student_update_norm"] = self._last_student_update_norm
         out["q_teacher_ema_update_norm"] = self._last_teacher_update_norm
         out["q_train_steps"] = float(self.q_train_steps.item())
-        return out
+        return out if self.use_ema else {k: v for k, v in out.items()
+                                        if not k.startswith("q_teacher_")}
 
     @torch.no_grad()
     def teacher_student_agreement(self, z: torch.Tensor) -> dict[str, float]:
         """How far ahead of the teacher the student has raced on this batch."""
+        if not self.use_ema:
+            return {}
         s_logits = self.q_student.logits(z, self.temperature)
         t_logits = self.q_teacher.logits(z, self.temperature)
         s_logp = torch.log_softmax(s_logits, dim=-1)
@@ -469,10 +492,14 @@ class VLMDeltaHeads(torch.nn.Module):
                           for k, v in self.q_teacher.state_dict().items()},
             "q_train_steps": int(self.q_train_steps.item()),
             "ema_beta": self.ema_beta,
+            "use_ema": self.use_ema,
             "temperature": self.temperature,
         }
 
     def load_q_state_dict(self, state: Mapping[str, Any], *, strict_config=True) -> None:
+        if strict_config and bool(state.get("use_ema", True)) != self.use_ema:
+            raise ValueError("checkpoint q EMA mode differs from this run; use --load_from "
+                             "for a new experiment or --vlm_q_use_ema for a legacy EMA run")
         self.q_student.load_state_dict(state["q_student"], strict=True)
         self.q_teacher.load_state_dict(state["q_teacher"], strict=True)
         self.q_train_steps.fill_(int(state.get("q_train_steps", 0)))
@@ -485,7 +512,7 @@ class VLMDeltaHeads(torch.nn.Module):
                     f"{self.temperature}; the p/q comparison is only valid at a "
                     f"single shared temperature"
                 )
-            if abs(saved_beta - self.ema_beta) > 1e-12:
+            if self.use_ema and abs(saved_beta - self.ema_beta) > 1e-12:
                 raise ValueError(
                     f"checkpoint q ema_beta {saved_beta} != configured {self.ema_beta}"
                 )

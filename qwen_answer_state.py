@@ -53,8 +53,8 @@ peak), ~18 img/s at microbatch 12 (29 GB peak).
 from __future__ import annotations
 
 import hashlib
+import math
 import logging
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
 
@@ -479,7 +479,7 @@ class QwenAnswerStateExtractor(torch.nn.Module):
         if self.compute_dtype in (torch.float16, torch.bfloat16):
             return torch.autocast(device_type="cuda", dtype=self.compute_dtype,
                                   enabled=True)
-        return nullcontext()
+        return torch.autocast(device_type=self.vlm_device.type, enabled=False)
 
     def answer_states(self, images: torch.Tensor,
                       layers: Optional[Iterable[int]] = None,
@@ -558,6 +558,7 @@ class QwenAnswerStateExtractor(torch.nn.Module):
         term_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         *,
         microbatch_size: Optional[int] = None,
+        loss_scale: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate ``term_fn(z, labels)`` and inject its first-order image VJP.
 
@@ -567,6 +568,10 @@ class QwenAnswerStateExtractor(torch.nn.Module):
         the intended mean.  Its gradient with respect to ``z`` is what reaches
         the generator.
 
+        ``loss_scale`` multiplies the term before the VLM backward; the image
+        gradient is divided by this scale in FP32 before injection. This can
+        diagnose underflow without changing the objective or its weight.
+
         Returns ``(surrogate, z_detached, selected)``:
 
         * ``surrogate`` -- value equal to this rank's share of the term, gradient
@@ -575,6 +580,8 @@ class QwenAnswerStateExtractor(torch.nn.Module):
           ``q`` replay buffer and every diagnostic;
         * ``selected`` -- which rows of ``images`` were scored.
         """
+        if not math.isfinite(loss_scale) or loss_scale <= 0:
+            raise ValueError("loss_scale must be finite and positive")
         self._validate_images(images)
         if not images.requires_grad:
             raise RuntimeError(
@@ -608,7 +615,7 @@ class QwenAnswerStateExtractor(torch.nn.Module):
             mb_labels = labels.index_select(0, mb_indices).long()
             # This leaf owns only a tiny image microbatch, never the generator's
             # graph, so the 7B activations die at the end of this iteration.
-            leaf = images.index_select(0, mb_indices).detach().requires_grad_(True)
+            leaf = images.index_select(0, mb_indices).detach().float().requires_grad_(True)
 
             z = self.answer_states(leaf)[self.layer]
             term = term_fn(z, mb_labels)
@@ -616,16 +623,18 @@ class QwenAnswerStateExtractor(torch.nn.Module):
                 raise ValueError(
                     f"term_fn must return a scalar, got shape {tuple(term.shape)}"
                 )
-            leaf_vjp = torch.autograd.grad(term, leaf, create_graph=False,
-                                           retain_graph=False)[0]
+            leaf_vjp = torch.autograd.grad(term * loss_scale, leaf, create_graph=False,
+                                           retain_graph=False)[0].float() / loss_scale
+            if not torch.isfinite(leaf_vjp).all():
+                raise RuntimeError("Non-finite VLM image VJP; reduce loss_scale or use fp32")
             chunk_value = term.detach()
             z_chunks.append(z.detach())
             del z, term
 
-            original = images.index_select(0, mb_indices)
-            coupling = (original * leaf_vjp.detach()).sum()
+            original = images.index_select(0, mb_indices).float()
+            coupling = ((original - original.detach()) * leaf_vjp.detach()).sum()
             # Numerically chunk_value; d/d original == leaf_vjp.
-            surrogate = surrogate + chunk_value + coupling - coupling.detach()
+            surrogate = surrogate + chunk_value + coupling
 
         z_detached = torch.cat(z_chunks, dim=0)
         self.last_stats = {

@@ -14,22 +14,22 @@ weights are the run's, not a reconstruction.  The p-head checkpoint IS the
 definition of z, and every identity check ``setup_vlm_delta`` performs is
 inherited here; a mismatch aborts.
 
-The scientific question is NOT whether ascent raises p.  It must: that is what
-a gradient does.  The question is whether an INDEPENDENT classifier that has
+The gradient points locally toward increasing p; finite steps need not increase
+p monotonically. The question is whether an INDEPENDENT classifier that has
 never been in any loss -- torchvision ResNet-50 ``IMAGENET1K_V2``, the repo's
 ``ProbeClassifier`` canary -- agrees that the image became the requested class.
 
     p rises to ~1.0, probe stays at chance, pixels barely move
         -> the field is classifier-specific/adversarial, not semantic.
-    p rises AND probe follows
-        -> the field carries class semantics.
+    p rises AND probe recognizes the target
+        -> classifier transfer, requiring visual inspection to assess semantics.
 
 Arms
 ----
 ``p``      (always)   ascend ``log p(c|z)``            -- the primary test
 ``delta``  (opt-in)   ascend ``log p(c|z) - log q_teacher(c|z)``
                       == descend the generator-facing ``log q - log p`` field.
-                      Needs ``vlm_delta_state`` in the generator checkpoint.
+                      Uses --q_ckpt (or --gen_ckpt); otherwise q=p is a zero-field control.
 ``fp32``   (opt-in)   the p arm again with an fp32 Qwen, plus the per-image
                       ``cos(g_bf16, g_fp32)`` at x0 (docs/vlm_delta.md Sec.3.3
                       measured 0.03 on real images -- this re-measures it on
@@ -42,6 +42,8 @@ MODE A ``--gen_ckpt``  : sample N images from a frozen generator checkpoint at
                          targets c.
 MODE B ``--images``    : fixed external image files with ``--image_classes``
                          giving one global ImageNet id per file.
+MODE C ``--synthetic_init`` : one deterministic gray/noise canvas with
+                              ``--synthetic_class`` as its target.
 
 Usage
 -----
@@ -58,6 +60,13 @@ Usage
         --vlm_p_head work_dirs/vlm_p_head_qwen_answer_c100/p_head.pt \
         --images a.png b.png --image_classes 207 360 \
         --out_dir work_dirs/diagnostics/external
+
+    # MODE C -- start from one nearly gray canvas and save every iterate
+    CUDA_VISIBLE_DEVICES=1 python scripts/test_vlm_p_gradient_semantics.py \
+        --vlm_p_head work_dirs/vlm_p_head_qwen_answer_c100/p_head.pt \
+        --synthetic_init gray_noise --synthetic_class 340 \
+        --num_steps 200 --alpha 0.5 --save_every_step \
+        --out_dir work_dirs/diagnostics/qwen_p_gray_zebra
 """
 
 from __future__ import annotations
@@ -103,6 +112,7 @@ from vlm_linear_heads import (
     p_head_backend,
     p_head_identity,
 )
+from scripts.vlm_input_saliency import InputGradientLogger
 
 logger = logging.getLogger("p_grad_semantics")
 
@@ -150,6 +160,17 @@ def get_parser():
     group.add_argument("--image_classes", type=int, nargs="+", default=None,
                        help="MODE B: one global ImageNet class id per --images entry")
 
+    # MODE C
+    group.add_argument("--synthetic_init",
+                       choices=("gray", "gray_noise", "uniform_noise"), default=None,
+                       help="MODE C: optimize one synthetic canvas: constant 0.5 gray, "
+                            "gray plus small Gaussian noise, or U[0,1] noise")
+    group.add_argument("--synthetic_class", type=int, default=None,
+                       help="MODE C: target global ImageNet class id")
+    group.add_argument("--synthetic_noise_std", type=float, default=1.0 / 255.0,
+                       help="MODE C gray_noise: Gaussian standard deviation in [0,1] "
+                            "pixel units (default: 1/255)")
+
     # the ascent
     group.add_argument("--num_steps", type=int, default=60)
     group.add_argument("--alpha", type=float, default=0.1,
@@ -175,9 +196,14 @@ def get_parser():
     # arms
     group.add_argument("--delta_mode", action="store_true",
                        help="also run the full-delta arm: ascend log p - log q_teacher, "
-                            "with q_teacher read from --gen_ckpt's vlm_delta_state")
+                            "using --q_ckpt or --gen_ckpt's vlm_delta_state; otherwise "
+                            "use the initial frozen q=p copy as a zero-gradient control")
+    group.add_argument("--q_ckpt", type=str, default=None,
+                       help="load frozen q_teacher from this training checkpoint's "
+                            "vlm_delta_state, independently of the image input mode; "
+                            "default for synthetic/external images is initial q=p")
     group.add_argument("--precision_control", action="store_true",
-                       help="after the main arms, reload Qwen in fp32 and report "
+                       help="after the main arms, reload Qwen in fp32 (TF32 disabled) and report "
                             "cos(g_bf16, g_fp32) at x0 plus a full fp32 p-arm")
 
     # outputs
@@ -185,6 +211,10 @@ def get_parser():
                        help="amplification factors for the perturbation visualisations")
     group.add_argument("--save_every_step", action="store_true",
                        help="save a PNG at every ascent step, not just checkpoint steps")
+    group.add_argument("--saliency_every", type=int, default=0,
+                       help="save raw input gradients of log p, log q, and log q-log p "
+                            "plus saliency maps at step 0, every N steps and the final "
+                            "step (0 disables; recommended 100)")
     group.add_argument("--no_heatmap", action="store_true")
     group.add_argument("--diag_seed", type=int, default=0)
     return parser
@@ -227,14 +257,27 @@ def resolve_args(argv):
 
     if not args.vlm_p_head:
         raise SystemExit("--vlm_p_head is required (see train_vlm_p_head.py)")
-    if bool(args.gen_ckpt) == bool(args.images):
-        raise SystemExit("give exactly one of --gen_ckpt (MODE A) or --images (MODE B)")
+    if args.vlm_q_lora:
+        raise SystemExit("this diagnostic supports linear q heads only, not --vlm_q_lora")
+    input_modes = sum(x is not None for x in
+                      (args.gen_ckpt, args.images, args.synthetic_init))
+    if input_modes != 1:
+        raise SystemExit("give exactly one of --gen_ckpt (MODE A), --images "
+                         "(MODE B), or --synthetic_init (MODE C)")
     if args.images and not args.image_classes:
         raise SystemExit("MODE B requires --image_classes, one global class id per image")
     if args.images and len(args.images) != len(args.image_classes):
         raise SystemExit(
             f"--images has {len(args.images)} entries but --image_classes has "
             f"{len(args.image_classes)}")
+    if args.synthetic_init and args.synthetic_class is None:
+        raise SystemExit("MODE C requires --synthetic_class")
+    if not math.isfinite(args.synthetic_noise_std) or args.synthetic_noise_std < 0:
+        raise SystemExit("--synthetic_noise_std must be finite and non-negative")
+    if args.num_steps < 1 or args.saliency_every < 0:
+        raise SystemExit("--num_steps must be positive and --saliency_every non-negative")
+    if not math.isfinite(args.alpha) or args.alpha <= 0:
+        raise SystemExit("--alpha must be finite and positive")
 
     # The head's own class list is the authority; the run dir only has to agree.
     ckpt_class_ids = [int(c) for c in load_p_head_checkpoint(args.vlm_p_head)["class_ids"]]
@@ -253,6 +296,10 @@ def resolve_args(argv):
         raise SystemExit("--checkpoint_steps is empty after clamping to [0, num_steps]")
     if args.checkpoint_steps[0] != 0:
         args.checkpoint_steps.insert(0, 0)
+    args.checkpoint_steps = sorted(set(args.checkpoint_steps + [args.num_steps]))
+    if args.saliency_every:
+        args.checkpoint_steps = sorted(set(args.checkpoint_steps).union(
+            range(0, args.num_steps + 1, args.saliency_every)))
 
     # Fields the training entry point sets in setup(); nothing here is distributed.
     args.world_size, args.rank, args.local_rank = 1, 0, 0
@@ -329,6 +376,9 @@ def load_q_teacher(vlm_judge, gen_ckpt_path):
         raise SystemExit(
             f"--delta_mode: {gen_ckpt_path} has no vlm_delta_state, so there is no "
             "q_teacher to read. Run the p arm alone.")
+    if state.get("q_lora") is not None:
+        raise SystemExit("this checkpoint uses LoRA q; loading only its linear head "
+                         "would give the wrong q input gradient")
     saved_identity = state.get("p_identity", {})
     live_identity = vlm_judge["vlm_p_identity"]
     if saved_identity and saved_identity != live_identity:
@@ -452,6 +502,37 @@ def mode_b_images(args, size):
             meta)
 
 
+@torch.no_grad()
+def mode_c_image(args, size):
+    """Create one deterministic synthetic canvas directly on the VLM device."""
+    shape = (1, 3, int(size), int(size))
+    generator = torch.Generator(device="cuda").manual_seed(int(args.diag_seed))
+    if args.synthetic_init == "gray":
+        x0 = torch.full(shape, 0.5, dtype=torch.float32, device="cuda")
+    elif args.synthetic_init == "gray_noise":
+        x0 = torch.full(shape, 0.5, dtype=torch.float32, device="cuda")
+        noise = torch.randn(shape, dtype=torch.float32, device="cuda",
+                            generator=generator)
+        x0 = (x0 + float(args.synthetic_noise_std) * noise).clamp(0, 1)
+    elif args.synthetic_init == "uniform_noise":
+        x0 = torch.rand(shape, dtype=torch.float32, device="cuda",
+                        generator=generator)
+    else:  # resolve_args guarantees one of the parser choices.
+        raise AssertionError(f"unknown synthetic init {args.synthetic_init!r}")
+    meta = {
+        "mode": "C_synthetic",
+        "initialization": args.synthetic_init,
+        "target_global_class": int(args.synthetic_class),
+        "seed": int(args.diag_seed),
+        "gray_noise_std": (float(args.synthetic_noise_std)
+                           if args.synthetic_init == "gray_noise" else None),
+        "size": int(size),
+    }
+    targets = torch.tensor([int(args.synthetic_class)], dtype=torch.long,
+                           device="cuda")
+    return x0, targets, meta
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -536,7 +617,8 @@ def _reduce(v, how):
 
 
 def ascend_group(x0, targets_global, targets_local, *, heads, extractor, probe,
-                 args, arm, want_cross_cosine):
+                 args, arm, want_cross_cosine, saliency_logger=None,
+                 output_arm=None, image_offset=0):
     """Full ascent for one microbatch-sized group.  Returns per-step records.
 
     Images are independent under this objective, so a group is exactly a batch
@@ -549,6 +631,11 @@ def ascend_group(x0, targets_global, targets_local, *, heads, extractor, probe,
     grad_at_x0 = None
 
     for t in range(args.num_steps + 1):
+        if saliency_logger is not None and (t % saliency_logger.every == 0
+                                             or t == args.num_steps):
+            saliency_logger.record(x, targets_local, heads, extractor, t,
+                                   output_arm or arm, image_offset, str(args.vlm_dtype))
+            logger.info("[%s] saved input gradients at step %d", output_arm or arm, t)
         need_grad = t < args.num_steps
         record = t in checkpoint_steps
         cross = want_cross_cosine and record and arm == "delta"
@@ -610,7 +697,7 @@ def ascend_group(x0, targets_global, targets_local, *, heads, extractor, probe,
 
 
 def run_arm(x0, targets_global, targets_local, *, vlm_judge, probe, args, arm,
-            want_cross_cosine=False):
+            want_cross_cosine=False, saliency_logger=None, output_arm=None):
     heads = vlm_judge["vlm_heads"]
     extractor = vlm_judge["vlm_extractor"]
     step = max(1, int(args.ascent_microbatch))
@@ -627,7 +714,8 @@ def run_arm(x0, targets_global, targets_local, *, vlm_judge, probe, args, arm,
         per_step, saved, g0 = ascend_group(
             x0[sl], targets_global[sl], targets_local[sl], heads=heads,
             extractor=extractor, probe=probe, args=args, arm=arm,
-            want_cross_cosine=want_cross_cosine)
+            want_cross_cosine=want_cross_cosine, saliency_logger=saliency_logger,
+            output_arm=output_arm, image_offset=start)
         for t, row in per_step.items():
             for k, v in row.items():
                 records[t].setdefault(k, []).append(v)
@@ -871,7 +959,7 @@ def aggregate(records, steps, num_classes):
     return out
 
 
-def verdict(summary, num_classes):
+def verdict(summary, num_classes, *, initial_q_control=False):
     """The go/no-go signature, stated in the terms the experiment was posed in."""
     first, last = summary[0], summary[-1]
     p_chance = 1.0 / num_classes
@@ -885,17 +973,26 @@ def verdict(summary, num_classes):
     span = max(probe_chance_rank - 1.0, 1.0)
     probe_rank_gain = (first["probe_target_rank_mean"] - last["probe_target_rank_mean"]) / span
     probe_moved = probe_moved_top1 or probe_rank_gain > 0.25
+    probe_recognizes = probe_moved_top1 or (
+        last["probe_top5_correct_mean"] > max(0.05, first["probe_top5_correct_mean"]))
     small_pixels = last["rms255_mean"] < 8.0
-    if (p_rose or rank_collapsed) and not probe_moved:
-        label = "ADVERSARIAL"
-        text = ("p is driven to near-certainty on the requested class while the "
-                "independent ResNet-50 probe does not move toward it. "
-                "grad_x log p(c|z) is a classifier-specific direction, not a "
-                "semantic class direction.")
-    elif (p_rose or rank_collapsed) and probe_moved:
-        label = "SEMANTIC"
-        text = ("p rises AND the independent probe follows toward the same target: "
-                "the field carries class semantics that transfer off the p head.")
+    if initial_q_control and last["rms255_mean"] == 0:
+        label = "EXPECTED-ZERO-FIELD"
+        text = ("q is an unchanged copy of p, so log p - log q cancels and the "
+                "image stays exactly unchanged. This is an initialization "
+                "control, not a test of a trained q.")
+    elif (p_rose or rank_collapsed) and not probe_recognizes:
+        label = "P-CONFIDENCE-WITHOUT-PROBE-RECOGNITION"
+        text = ("p confidence/rank improves without new target recognition by the "
+                "independent probe. Its rank may improve while remaining far "
+                "from top-5; that alone does not establish semantic generation. "
+                "Inspect the saved images for class structure or classifier shortcuts.")
+    elif (p_rose or rank_collapsed) and probe_recognizes:
+        label = "PROBE-TRANSFER"
+        text = ("p confidence/rank improves and target recognition transfers to "
+                "the independent probe. This can also occur for transferable "
+                "adversarial patterns; inspect the images before claiming "
+                "semantic generation.")
     elif not (p_rose or rank_collapsed):
         label = "INCONCLUSIVE-NO-ASCENT"
         text = ("the ascent did not reliably raise p(c|z); the diagnostic says "
@@ -908,6 +1005,7 @@ def verdict(summary, num_classes):
         "label": label, "text": text,
         "p_rose": bool(p_rose), "p_rank_collapsed": bool(rank_collapsed),
         "probe_moved": bool(probe_moved),
+        "probe_recognizes": bool(probe_recognizes),
         "probe_rank_gain_fraction_of_chance_span": float(probe_rank_gain),
         "perturbation_small": bool(small_pixels),
     }
@@ -951,6 +1049,13 @@ def main(argv=None):
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
+    if args.vlm_disable_tf32 or args.vlm_dtype == "fp32":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    base_precision_settings = {
+        "matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+    }
     torch.manual_seed(args.diag_seed)
     torch.cuda.manual_seed_all(args.diag_seed)
 
@@ -968,10 +1073,11 @@ def main(argv=None):
     size = int(identity["vlm_input_size"])
 
     q_info = None
-    if args.delta_mode:
-        if not args.gen_ckpt:
-            raise SystemExit("--delta_mode needs --gen_ckpt to read vlm_delta_state from")
-        q_info = load_q_teacher(vlm_judge, args.gen_ckpt)
+    q_path = args.q_ckpt or (args.gen_ckpt if args.delta_mode or args.saliency_every else None)
+    q_source = os.path.abspath(q_path) if q_path else "initial copy of p (q=p), frozen throughout"
+    if q_path:
+        q_info = load_q_teacher(vlm_judge, q_path)
+    logger.info("q_teacher source: %s", q_source)
 
     logger.info("building the held-out ResNet-50 IMAGENET1K_V2 probe (never in any loss)")
     probe = ProbeClassifier(device="cuda")
@@ -979,8 +1085,10 @@ def main(argv=None):
 
     if args.gen_ckpt:
         x0, targets_global, input_meta = mode_a_images(args)
-    else:
+    elif args.images:
         x0, targets_global, input_meta = mode_b_images(args, size)
+    else:
+        x0, targets_global, input_meta = mode_c_image(args, size)
     if x0.shape[-1] != size or x0.shape[-2] != size:
         raise SystemExit(
             f"x0 is {tuple(x0.shape[-2:])} but the p head defines z at {size}px")
@@ -1004,6 +1112,9 @@ def main(argv=None):
     }
     if any(frozen.values()):
         raise SystemExit(f"a model is not frozen: {frozen}")
+    saliency_logger = (InputGradientLogger(out, args.saliency_every, image_ids,
+                                          targets_global, q_source)
+                       if args.saliency_every else None)
 
     if args.grad_mode == "normalized":
         per_step_rms = 255.0 * args.alpha / math.sqrt(3 * size * size)
@@ -1019,7 +1130,8 @@ def main(argv=None):
 
     logger.info("=== arm p: ascend log p(c|z) ===")
     rec_p, imgs_p, g0_p = run_arm(x0, targets_global, targets_local,
-                                  vlm_judge=vlm_judge, probe=probe, args=args, arm="p")
+                                  vlm_judge=vlm_judge, probe=probe, args=args, arm="p",
+                                  saliency_logger=saliency_logger)
     arms["p"] = (rec_p, imgs_p)
     grads0["p"] = g0_p
 
@@ -1027,7 +1139,8 @@ def main(argv=None):
         logger.info("=== arm delta: ascend log p(c|z) - log q_teacher(c|z) ===")
         rec_d, imgs_d, g0_d = run_arm(x0, targets_global, targets_local,
                                       vlm_judge=vlm_judge, probe=probe, args=args,
-                                      arm="delta", want_cross_cosine=True)
+                                      arm="delta", want_cross_cosine=True,
+                                      saliency_logger=saliency_logger)
         arms["delta"] = (rec_d, imgs_d)
         grads0["delta"] = g0_d
 
@@ -1035,6 +1148,8 @@ def main(argv=None):
     if args.precision_control:
         base_dtype = str(args.vlm_dtype)
         logger.info("=== precision control: reloading Qwen in fp32 ===")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
         g0_base = grads0["p"].clone()
         del vlm_judge["vlm_extractor"], vlm_judge["model"]
         vlm_judge.pop("vlm_buffer", None)
@@ -1045,17 +1160,19 @@ def main(argv=None):
         fp32_args.vlm_dtype = "fp32"
         fp32_args.ascent_microbatch = max(1, args.ascent_microbatch // 3)
         fp32_judge, fp32_identity = build_vlm(fp32_args)
-        if args.delta_mode:
-            load_q_teacher(fp32_judge, args.gen_ckpt)
+        if q_path:
+            load_q_teacher(fp32_judge, q_path)
         rec_f, imgs_f, g0_f = run_arm(x0, targets_global, targets_local,
                                       vlm_judge=fp32_judge, probe=probe,
-                                      args=fp32_args, arm="p")
+                                      args=fp32_args, arm="p",
+                                      saliency_logger=saliency_logger, output_arm="p_fp32")
         arms["p_fp32"] = (rec_f, imgs_f)
         cos = F.cosine_similarity(g0_base.flatten(1), g0_f.flatten(1), dim=1)
         ratio = (g0_base.flatten(1).norm(dim=1)
                  / g0_f.flatten(1).norm(dim=1).clamp_min(EPS))
         precision = {
             "base_dtype": base_dtype, "compare_dtype": "fp32",
+            "matmul_allow_tf32": False, "cudnn_allow_tf32": False,
             "cos_per_image": [float(v) for v in cos],
             "cos_mean": float(cos.mean()), "cos_median": float(cos.median()),
             "grad_norm_ratio_mean": float(ratio.mean()),
@@ -1067,6 +1184,8 @@ def main(argv=None):
         vlm_judge = fp32_judge
 
     # -- write everything ---------------------------------------------------
+    if saliency_logger is not None:
+        saliency_logger.finish()
     all_rows = []
     summaries = {}
     for arm, (records, images) in arms.items():
@@ -1105,7 +1224,9 @@ def main(argv=None):
             for r in s:
                 w.writerow({"arm": arm, **r})
 
-    verdicts = {arm: verdict(s, num_classes) for arm, s in summaries.items()}
+    verdicts = {arm: verdict(s, num_classes,
+                            initial_q_control=arm == "delta" and q_path is None)
+                for arm, s in summaries.items()}
     payload = {
         "command": "python " + " ".join([os.path.relpath(sys.argv[0], REPO_ROOT)] + argv),
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1121,6 +1242,12 @@ def main(argv=None):
             "clamp": "[0,1] after every step",
         },
         "q_teacher": q_info,
+        "q_source": q_source,
+        "saliency_every": args.saliency_every,
+        "frozen": frozen,
+        "base_precision_settings": base_precision_settings,
+        "hardware": {"gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
+                     "cuda": torch.version.cuda, "slurm_job_id": os.getenv("SLURM_JOB_ID")},
         "precision_control": precision,
         "summary": summaries,
         "verdict": verdicts,
@@ -1130,14 +1257,14 @@ def main(argv=None):
         json.dump(payload, f, indent=1)
 
     write_report(out, args, identity, input_meta, summaries, verdicts, num_classes,
-                 q_info, precision, payload["command"], image_ids)
+                 q_info, precision, payload["command"], image_ids, q_source)
     logger.info("wrote %s", out / "REPORT.md")
     print(open(out / "REPORT.md").read())
     return 0
 
 
 def write_report(out, args, identity, input_meta, summaries, verdicts, num_classes,
-                 q_info, precision, command, image_ids):
+                 q_info, precision, command, image_ids, q_source):
     p_sum = summaries["p"]
     first, last = p_sum[0], p_sum[-1]
     v = verdicts["p"]
@@ -1168,6 +1295,15 @@ def write_report(out, args, identity, input_meta, summaries, verdicts, num_class
         f"- independent probe: torchvision ResNet-50 `IMAGENET1K_V2`, never in any loss",
         "",
     ]
+    lines += [f"- q_teacher: {q_source}", ""]
+    if args.saliency_every:
+        lines += [
+            f"Input gradients saved every {args.saliency_every} steps, plus step 0 and final.",
+            "See [saliency maps, norms and explanation](saliency/README.md).",
+            "If q is an initial copy of p and both remain frozen, their individual",
+            "input gradients should agree at every image; the combined field should vanish.",
+            "This initialization control does not test a q trained on generated images.", "",
+        ]
     if q_info:
         lines += [
             "### q_teacher (delta arm)",
@@ -1185,7 +1321,11 @@ def write_report(out, args, identity, input_meta, summaries, verdicts, num_class
     if "delta" in summaries:
         cos_key = [r.get("cos_g_delta_g_p_mean") for r in summaries["delta"]
                    if "cos_g_delta_g_p_mean" in r]
-        if cos_key:
+        if verdicts["delta"]["label"] == "EXPECTED-ZERO-FIELD":
+            lines += ["### Does q change the field?", "",
+                      "The combined gradient is zero and has no direction, so its cosine",
+                      "with the p gradient is undefined (the legacy metrics use a zero placeholder).", ""]
+        elif cos_key:
             lines += [
                 "### Does q change the field?",
                 "",
@@ -1232,15 +1372,15 @@ def write_report(out, args, identity, input_meta, summaries, verdicts, num_class
         "",
         f"**Is the p gradient semantic or adversarial?** **{v['label']}.** {v['text']}",
         "",
-        "Note: the gradient is not \"wrong\" for raising p — mathematically it does "
-        "exactly what it must. The scientific issue is only whether an independent "
-        "classifier agrees that the image became the requested class.",
+        "A gradient is a local derivative; normalized finite steps can lower p. "
+        "Classifier confidence and rank alone do not establish semantic generation. "
+        "Use the image trajectory together with the independent probe results.",
         "",
     ]
     if "delta" in verdicts:
         lines += [
             "**If full-delta mode was tested, does q materially change the field?** "
-            f"delta arm verdict: **{verdicts['delta']['label']}**. See the cosine above.",
+            f"delta arm verdict: **{verdicts['delta']['label']}**. {verdicts['delta']['text']}",
             "", ]
     lines += [
         "## Files",

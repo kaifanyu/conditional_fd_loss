@@ -349,15 +349,13 @@ class Bf16PrecisionTest(unittest.TestCase):
         z (the feature itself)         cos 0.9999        cos 1.0000
         dz-driven image gradient       cos 0.03          cos -0.48
 
-    The forward is faithful, so the frozen ``p`` head -- which only ever sees
-    ``z`` -- is unaffected by the choice, and features cached in bf16 are as good
-    as fp32 ones.  The *image gradient* is not: rounding the weights to 7
-    mantissa bits rotates it almost completely, and fp16 is worse still (its
-    magnitude is 5x too large, the classic un-loss-scaled backward).  This is not
-    an implementation defect -- :class:`VJPSurrogateTest` shows the surrogate is
-    exact in fp32 -- but a statement about how ill-conditioned d z / d x is
-    through a 28-layer decoder.  Anything that reads the generator's VLM gradient
-    has to be calibrated with that in mind.
+    High feature cosine does not establish equivalent classifier probabilities
+    or image gradients. These observations alone do not identify weight
+    rounding, activation/backward rounding, cancellation, or under/overflow as
+    the cause. In particular a larger fp16 gradient does not diagnose underflow.
+    Compare fixed inputs/heads/layers, per-branch gradients and loss scales
+    against fp32 before attributing the discrepancy. VJPSurrogateTest checks
+    the surrogate itself within a fixed dtype.
 
     This test asserts only what must hold: the forward is faithful, and one
     dtype is self-consistent at a fixed batch shape.  The gradient divergence is

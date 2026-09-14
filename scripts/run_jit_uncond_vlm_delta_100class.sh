@@ -3,14 +3,14 @@
 #
 # THE OBJECTIVE, and nothing else:
 #
-#   L = L_FD + lambda * E[ log q_teacher(c | E_VLM(G(eps,c))) - log p(c | E_VLM(G(eps,c))) ]
+#   L = L_FD + lambda * E[ log q(c | x) - log p(c | x) ]
 #
 #   * one frozen VLM (SigLIP-SO400M) -- it is ALREADY an FD judge here, so z is
 #     computed once per step and the conditional term costs one linear layer
 #   * p: a linear head trained offline on REAL images, then frozen forever
 #   * q: the same architecture, initialised from p, trained online by cross
 #     entropy on DETACHED generated (image, sampled label) pairs
-#   * the generator sees a slow EMA teacher of q, never the raw student
+#   * the generator sees the current student; Q_USE_EMA=1 opts into an EMA teacher
 #
 # It is NOT the class-summed posterior KL (that is --fd_gmm_mode posterior in
 # conditional_main_fd_gmm.py; it is label-blind and died at its gate on
@@ -66,8 +66,11 @@ source "${SCRIPT_DIR}/imagenet100_class_ids.sh"
 : "${HEAD_TEMPERATURE:=}"
 
 # -- q head: deliberately slow --
-: "${Q_LR:=1e-3}"
+: "${Q_LR:=1e-4}"
 : "${Q_OPTIMIZER:=adamw}"
+: "${Q_BETA1:=0.0}"
+: "${Q_BETA2:=0.999}"
+: "${Q_USE_EMA:=0}"
 # NOT optional. An unregularised online head on a signal-free stream random-walks
 # away from p, so ||W_q - W_p|| -- and with it the injected field and
 # grad_ratio_vlm_fd -- grows without bound and no weight stays calibrated.
@@ -152,7 +155,13 @@ mapfile -t VIS_CLASSES < <(printf '%s\n' "${CLASS_IDS[@]}" | awk 'NR % 5 == 1')
 # IS the definition of z. These are only the runtime knobs for the 7B path.
 # Measured on A100-80GB: microbatch 12 -> 29 GB peak / ~18 img/s, 24 -> 41 GB /
 # ~20 img/s, both alongside the three FD judges.
-: "${VLM_MICROBATCH:=12}"
+: "${Q_LORA:=0}"
+if [[ "${Q_LORA}" == "1" ]]; then
+    : "${VLM_MICROBATCH:=1}"
+    : "${VLM_DTYPE:=fp32}"
+else
+    : "${VLM_MICROBATCH:=12}"
+fi
 # 0 = score the whole per-rank batch. A smaller K trades gradient variance for
 # step time and stays unbiased (generated batch elements are exchangeable).
 : "${VLM_SAMPLES_PER_STEP:=0}"
@@ -194,6 +203,12 @@ is_bool "${AUTO_RESUME}" || die "AUTO_RESUME must be 0 or 1"
 is_bool "${RESUME}" || die "RESUME must be 0 or 1"
 is_bool "${RUN_FOREGROUND}" || die "RUN_FOREGROUND must be 0 or 1"
 is_bool "${CALIBRATION}" || die "CALIBRATION must be 0 or 1"
+is_bool "${Q_LORA}" || die "Q_LORA must be 0 or 1"
+is_bool "${Q_USE_EMA}" || die "Q_USE_EMA must be 0 or 1"
+if [[ "${Q_LORA}" == "1" ]]; then
+    (( Q_BOOTSTRAP_UPDATES == 0 )) || die "LoRA q starts equal to p; Q_BOOTSTRAP_UPDATES must be 0"
+    Q_BOOTSTRAP=0
+fi
 if [[ "${RESUME}" == "1" ]]; then
     AUTO_RESUME=1
 elif [[ "${AUTO_RESUME}" != "0" ]]; then
@@ -302,6 +317,9 @@ print(f"p head OK [{backend}]: {ckpt['num_classes']}-way on "
 print(backend)
 PYEOF
 )" || die "p-head precheck failed"
+if [[ "${Q_LORA}" == "1" && "${P_HEAD_BACKEND}" != "qwen_answer_state" ]]; then
+    die "Q_LORA=1 requires a Qwen answer-state P_HEAD"
+fi
 
 RUN_DIR="${OUTPUT_DIR}/${PROJECT}/${EXP_NAME}"
 mkdir -p "${LOG_DIR}"
@@ -357,6 +375,8 @@ CMD=(
     --vlm_delta_clamp "${DELTA_CLAMP}"
     --vlm_q_lr "${Q_LR}"
     --vlm_q_optimizer "${Q_OPTIMIZER}"
+    --vlm_q_beta1 "${Q_BETA1}"
+    --vlm_q_beta2 "${Q_BETA2}"
     --vlm_q_weight_decay "${Q_WEIGHT_DECAY}"
     --vlm_q_grad_clip "${Q_GRAD_CLIP}"
     --vlm_q_updates_per_step "${Q_UPDATES_PER_STEP}"
@@ -377,6 +397,10 @@ CMD=(
 )
 
 if [[ "${RESUME}" == "1" ]]; then CMD+=(--auto_resume); fi
+if [[ "${Q_USE_EMA}" == "1" ]]; then CMD+=(--vlm_q_use_ema); fi
+if [[ "${Q_LORA}" == "1" ]]; then
+    CMD+=(--vlm_q_lora --vlm_disable_tf32)
+fi
 
 if [[ -n "${HEAD_TEMPERATURE}" ]]; then
     CMD+=(--vlm_head_temperature "${HEAD_TEMPERATURE}")
@@ -408,7 +432,7 @@ fi
 MODE_LABEL=$([[ "${CALIBRATION}" == "1" ]] && echo "WEIGHT CALIBRATION" \
     || { [[ "${RESUME}" == "1" ]] && echo "full trial (RESUMING from step ${RESUME_STEP})" || echo "full trial"; })
 echo "Experiment:       ${PROJECT}/${EXP_NAME} (${MODE_LABEL})"
-echo "Objective:        L_FD + ${WEIGHT} * E[log q_teacher(c|z) - log p(c|z)],  z = E_VLM(x)"
+echo "Objective:        L_FD + ${WEIGHT} * E[log q(c|x) - log p(c|x)]"
 echo "GPUs:             ${GPUS} (${NPROC_PER_NODE} ranks)"
 EFF_LR=$(awk -v l="${LR}" -v w="${NPROC_PER_NODE}" 'BEGIN{printf "%.4g", l/w}')
 echo "Batch:            ${BATCH_SIZE}/GPU, global ${GLOBAL_BATCH}"
@@ -416,11 +440,16 @@ echo "LR:               ${LR} over ${NPROC_PER_NODE} ranks -> effective ${EFF_LR
 echo "Classes:          ${NUM_TRAIN_CLASSES} (${CLASS_IDS[0]} ${CLASS_IDS[1]} ... ${CLASS_IDS[-1]}), stride-10 subset"
 echo "Iterations:       ${TOTAL_STEPS} = ${SAMPLES_PER_CLASS_AT_END} samples/class"
 if [[ "${P_HEAD_BACKEND}" == "qwen_answer_state" ]]; then
-    echo "VLM:              Qwen2.5-VL answer state -- FROZEN, and NOT an FD judge:"
-    echo "                  it adds a 7B forward+backward per scored image every step"
+    if [[ "${Q_LORA}" == "1" ]]; then
+        echo "VLM:              Qwen2.5-VL frozen base + trainable q LoRA adapters"
+        echo "                  two image-VJP branches plus student CE backward per step"
+    else
+        echo "VLM:              Qwen2.5-VL frozen answer state, separate from FD judges"
+        echo "                  adds a 7B forward+backward per scored image every step"
+    fi
     echo "                  (microbatch ${VLM_MICROBATCH}, ${VLM_DTYPE}, samples/rank/step \
 ${VLM_SAMPLES_PER_STEP:-all}). Check s/step in the first 50 log lines before"
-    echo "                  committing: ~20 img/s/GPU means ~1.2 s/step at batch 24."
+    echo "                  committing. LoRA and fp32 require fresh timing/memory measurements."
 else
     echo "VLM:              ${FD_MODELS[0]} (judge '${VLM_JUDGE}', pool ${FD_POOLS[0]}, ${FD_SIZES[0]}px) -- FROZEN"
 fi
@@ -429,9 +458,22 @@ Q_BATCH_EFF=$(( Q_BATCH_SIZE > 0 ? Q_BATCH_SIZE : GLOBAL_BATCH ))
 Q_REUSE=$(awk -v b="${Q_BATCH_EFF}" -v u="${Q_UPDATES_PER_STEP}" -v g="${GLOBAL_BATCH}" \
     'BEGIN{printf "%.2f", b*u/g}')
 echo "q head:           init from p; ${Q_OPTIMIZER} lr=${Q_LR} wd=${Q_WEIGHT_DECAY}, ${Q_UPDATES_PER_STEP} update(s)/step,"
-echo "                  batch ${Q_BATCH_EFF} from a ${Q_BUFFER_SIZE}-entry class-balanced buffer"
-echo "                  -> sample reuse ${Q_REUSE}x (keep near 1; >2 memorises the buffer),"
-echo "                  EMA teacher beta=${Q_EMA_BETA} (the generator sees the TEACHER)"
+if [[ "${Q_LORA}" == "1" ]]; then
+    echo "                  fresh scored images with recomputed adapted features; no replay buffer"
+else
+    echo "                  batch ${Q_BATCH_EFF} from a ${Q_BUFFER_SIZE}-entry class-balanced buffer"
+fi
+if [[ "${Q_LORA}" == "1" ]]; then
+    echo "                  -> ${Q_UPDATES_PER_STEP} pass(es) per fresh scored batch"
+else
+    echo "                  -> sample reuse ${Q_REUSE}x (keep near 1; >2 memorises the buffer),"
+fi
+echo "                  AdamW betas=(${Q_BETA1}, ${Q_BETA2})"
+if [[ "${Q_USE_EMA}" == "1" ]]; then
+    echo "                  generator reads EMA teacher, beta=${Q_EMA_BETA}"
+else
+    echo "                  generator reads current student directly; no q EMA updates"
+fi
 echo "Temperature:      ${HEAD_TEMPERATURE:-from the p-head checkpoint} (shared by p and q)"
 if awk -v v="${DELTA_CLAMP}" 'BEGIN{exit !(v+0 > 0)}'; then
     echo "Clamp:            ${DELTA_CLAMP} (ON -- CHANGES the objective; report vlm_delta_clamp_frac with the result)"

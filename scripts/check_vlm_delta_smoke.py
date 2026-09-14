@@ -72,8 +72,10 @@ def main() -> int:
           abs(init["p"]["p_target_rank"] - init["chance_mean_rank"])
           < 0.10 * init["chance_mean_rank"],
           f"rank {init['p']['p_target_rank']:.2f} vs chance {init['chance_mean_rank']:.1f}")
-    check("q_teacher matches p at init",
-          init["q_teacher"]["q_teacher_target_logp"] == init["p"]["p_target_logp"])
+    use_ema = init.get("q_generator_source", "teacher") == "teacher"
+    active_q = "q_teacher" if use_ema else "q_student"
+    check(f"{active_q} matches p at init",
+          init[active_q][f"{active_q}_target_logp"] == init["p"]["p_target_logp"])
 
     print("\n[2/8] the conditional term is exactly zero at step 0")
     check("vlm_delta_logqp == 0 at step 0", first["vlm_delta_logqp"] == 0.0,
@@ -101,7 +103,7 @@ def main() -> int:
     check("every logged grad_x_vlm_delta is finite",
           all(math.isfinite(r["grad_x_vlm_delta"]) for r in rows if "grad_x_vlm_delta" in r))
 
-    print("\n[5/8] q_student learns; q_teacher lags")
+    print("\n[5/8] q_student learns; active q is " + active_q)
     # q starts AT p, which is a bad classifier of generated images (measured:
     # CE 7.70 on generated features against a uniform of 4.61), so any q that is
     # training at all must improve on its own starting point.  Compared against
@@ -112,10 +114,11 @@ def main() -> int:
           f"{rows[0]['q_ce']:.3f} -> {last['q_ce']:.3f}")
     check("q_student drifted from p", last["q_student_weight_delta_l2"] > 1e-3,
           f"{last['q_student_weight_delta_l2']:.4f}")
-    check("q_teacher drifted less than q_student",
-          last["q_teacher_weight_delta_l2"] < last["q_student_weight_delta_l2"],
-          f"teacher {last['q_teacher_weight_delta_l2']:.5f} vs student "
-          f"{last['q_student_weight_delta_l2']:.5f}")
+    if use_ema:
+        check("q_teacher drifted less than q_student",
+              last["q_teacher_weight_delta_l2"] < last["q_student_weight_delta_l2"],
+              f"teacher {last['q_teacher_weight_delta_l2']:.5f} vs student "
+              f"{last['q_student_weight_delta_l2']:.5f}")
 
     print("\n[6/8] the q training data stays class-balanced and q is not memorising")
     check("buffer covers every class", last["q_buffer_class_coverage"] == 1.0,
@@ -154,7 +157,8 @@ def main() -> int:
 
     heads = VLMDeltaHeads(build_head_from_checkpoint(ckpt, device="cpu"),
                           temperature=float(state["q"]["temperature"]),
-                          ema_beta=float(state["q"]["ema_beta"]))
+                          ema_beta=float(state["q"]["ema_beta"]),
+                          use_ema=bool(state["q"].get("use_ema", True)))
     heads.load_q_state_dict(state["q"])
     exact = all(
         torch.equal(getattr(heads, name).linear.state_dict()[key],
