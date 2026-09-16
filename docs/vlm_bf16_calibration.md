@@ -1,9 +1,13 @@
 # BF16 generator, FD extractors, and Qwen LoRA-q training on Slurm
 
-The active Blackwell preset starts a **fresh 15,000-step training run** from
-`JiT-B-uncond.pth`, using six GPUs, global batch 48, and sample grids every
-1,500 steps. The standalone shared launcher still defaults to a separate
-3,000-step weight calibration with four GPUs and global batch 96.
+The active GRASP preset starts a **fresh 15,000-step training run** from
+`JiT-B-uncond.pth`, using six RTX A6000 GPUs on `enough-oryx.grasp.maas`, global
+batch 48, and sample grids every 1,500 steps. The standalone shared launcher
+still defaults to a separate 3,000-step weight calibration with four GPUs and
+global batch 96.
+
+The script filename, job/log names, and experiment prefix retain `blackwell`
+for continuity. That historical name does not describe the current GPU target.
 
 Both configurations retain the same 100-class conditional FD/VLM objective.
 The generator, frozen FD feature networks, Qwen backbone, p/q classifier
@@ -17,7 +21,7 @@ log probabilities and image-VJP reductions retain FP32. Classifier feature
 normalization follows the BF16 parameter dtype.
 These numerical reductions do not maintain or update FP32 model parameters.
 
-| Run setting | Active Blackwell preset | Standalone calibration default |
+| Run setting | Active GRASP RTX A6000 preset | Standalone calibration default |
 |---|---|---|
 | Launcher | `sbatch_vlm_lora_q_bf16_blackwell.sh` | `run_vlm_lora_q_bf16_calibration.sh` |
 | Mode | `CALIBRATION=0` | `CALIBRATION=1` |
@@ -47,7 +51,7 @@ of about 0.072 at weight `1e-5`. It is **not a validated BF16 weight**. Read the
 sustained ratio again alongside the new sample grids; 0.22-0.30 remains a
 calibration target, not a guarantee of conditioning.
 
-The Blackwell run uses the default name
+The active run retains the default name
 `qwen_lora_fullbf16_blackwell_b48_15k_vis1500_JOB_ID`. Its six-rank batch-48
 configuration changes training dynamics relative to the previous four-rank
 batch-96 experiment. Generator LR stays explicitly at `1e-5`; it is not
@@ -161,14 +165,15 @@ revision mismatches. It does not verify weight bytes. Use the same model
 revision, prompt, and layer as the original head. This new p-head identity is
 for the fresh run; do not resume an old generator run against a relocated head.
 
-## Preview and submit the active Blackwell run
+## Preview and submit the active six-GPU run
 
 Set destination paths once in the shell used to call `sbatch`:
 
 ```bash
 cd /path/to/conditional_fd_loss
 export PY_BIN=/path/to/environment/bin/python
-export DATA_PATH=/path/to/imagenet
+# Parent directory: the launcher checks/appends train/ itself.
+export DATA_PATH=/mnt/projects/jg/kaifany/dataset/imagenet
 export START_CKPT=/path/to/JiT-B-uncond.pth
 export STATS_DIR=/path/to/imagenet100_v1
 export P_HEAD=/path/to/p_head_local.pt
@@ -184,13 +189,18 @@ DRY_RUN=1 SLURM_JOB_ID=preview SLURM_SUBMIT_DIR="$PWD" \
 sbatch --export=ALL scripts/sbatch_vlm_lora_q_bf16_blackwell.sh
 ```
 
-The wrapper targets `jg-b6000-0.grasp.maas` in `gu-compute`, requesting
+The wrapper targets `enough-oryx.grasp.maas` in partition `batch`, using account
+`gu-account` and QOS `normal`, requesting
 **six GPUs, 48 CPUs, 256 GB host memory, and 24 hours**. It uses
-`--gres=gpu:6`, so the long GPU type string is unnecessary. GPU availability
-and queue wait still depend on other jobs. Account and QOS use cluster
-defaults; add `--account=gu-account` if that is your required allocation, or
-supply your assigned account. Resource/time limits and account access must be
-valid for `gu-compute` on the server.
+`--gres=gpu:6` on this RTX A6000 node. GPU availability and queue wait still
+depend on other jobs. Its default `DATA_PATH` is
+`/mnt/projects/jg/kaifany/dataset/imagenet`, so the training split path is
+`/mnt/projects/jg/kaifany/dataset/imagenet/train`. An exported `DATA_PATH`
+overrides that default; use the parent directory, not the `train` directory.
+
+Copy the updated repository to the server before the next submission. Editing
+these local files does not change the allocation or settings of an already
+submitted or running Slurm job.
 
 To preview the same training settings directly through the shared launcher:
 
@@ -206,11 +216,11 @@ It must omit `--disable_vis` and `--online_eval`. Visualization frequency is
 expressed in launcher epochs: `1 * 1500` steps. The independent per-class
 diagnostics and conditional probe remain enabled.
 
-Use a Blackwell-compatible CUDA PyTorch environment. PyTorch introduced Blackwell
-support with its [2.7 CUDA 12.8 builds](https://pytorch.org/blog/pytorch-2-7/);
-do not assume an older environment copied from another GPU server will work.
+Use a CUDA PyTorch environment compatible with RTX A6000 and this repository's
+required packages. The retained `blackwell` script name
+does not impose a Blackwell-specific CUDA requirement on this allocation.
 The existing allocation check runs BF16 backward arithmetic and NCCL before
-loading the training models. The Blackwell Slurm log is
+loading the training models. The retained Slurm log name is
 `slurm-vlm-blackwell-JOB_ID.out`. Full-model memory use and throughput on this
 six-GPU configuration still need measurement.
 
@@ -234,7 +244,7 @@ selects the frozen Qwen backbone dtype.
 
 ## Separate 3,000-step calibration
 
-Calling the shared launcher without the Blackwell wrapper retains its original
+Calling the shared launcher without the node-specific wrapper retains its original
 four-rank, global-batch-96 calibration defaults. This mode disables sample
 grids and online evaluation and uses `CAL_STEPS=3000`:
 
@@ -249,7 +259,7 @@ EXP_NAME=qwen_fullbf16_scaled_cal_v1 \
 
 The generic Slurm wrapper requests four GPUs, 32 CPUs, 256 GB host memory, and
 24 hours. Select the account/partition and GPU type for that destination. The
-Blackwell wrapper deliberately overrides this shared launcher's run mode,
+node-specific wrapper deliberately overrides this shared launcher's run mode,
 batch, duration, visualization settings, and default generator LR.
 
 ## Follow the run and inspect sample grids
@@ -317,12 +327,12 @@ It changes activation memory and throughput, not global batch size. For a short
 pipeline check with the standalone calibration, set
 `CALIBRATION=1 CAL_STEPS=50 INIT_DIAG_SAMPLES=8` and a unique `EXP_NAME`.
 It still fills the normal FD queue and is too short to calibrate the final weight.
-For the Blackwell training mode (`CALIBRATION=0`), duration is controlled by
+For the active training mode (`CALIBRATION=0`), duration is controlled by
 `EPOCHS * STEPS_PER_EPOCH`; `CAL_STEPS` does not change its 15,000-step budget.
 
 When changing GPU count, set both `NPROC_PER_NODE` and Slurm's `--gres` to
 match. `GLOBAL_BATCH` must divide evenly across ranks. The standalone launcher's
-historical LR convention applies only when `LR` is unset; the Blackwell wrapper
+historical LR convention applies only when `LR` is unset; the node-specific wrapper
 explicitly defaults to `LR=1e-5`. Changing rank count or global batch still
 requires fresh timing and calibration measurements.
 
@@ -336,7 +346,7 @@ sbatch --export=ALL scripts/sbatch_vlm_lora_q_bf16_blackwell.sh
 ```
 
 Use the same launcher and experiment name as the original run. A standalone
-calibration resumes through the generic wrapper instead of the Blackwell
+calibration resumes through the generic wrapper instead of the node-specific
 training wrapper.
 
 Start the new BF16 experiment with `RESUME=0` and a new name. Both the old FP32
