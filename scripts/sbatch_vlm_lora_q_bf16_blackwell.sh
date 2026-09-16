@@ -30,6 +30,11 @@ cd "${TRAINING_ROOT}"
 export PY_BIN="${PY_BIN:-${TRAINING_ROOT}/.venv/bin/python}"
 # The underlying launcher appends /train, so DATA_PATH is the ImageNet root.
 export DATA_PATH="${DATA_PATH:-/mnt/projects/jg/kaifany/dataset/imagenet}"
+# Reuse the shared model caches configured by the original GRASP launcher.
+# The training launcher defaults to offline Hugging Face access.
+export HF_HOME="${HF_HOME:-/mnt/projects/jg/kaifany/.hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+export TORCH_HOME="${TORCH_HOME:-/mnt/projects/jg/kaifany/.torch}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-6}"
 export GLOBAL_BATCH="${GLOBAL_BATCH:-48}"
 # Regular training keeps the previous visualization machinery enabled.
@@ -44,4 +49,6 @@ export EXP_NAME="${EXP_NAME:-qwen_lora_fullbf16_blackwell_b48_15k_vis1500_${SLUR
 # Set START_CKPT, STATS_DIR, P_HEAD, HF_HOME, and TORCH_HOME before sbatch if
 # those assets are outside the launcher's repository-relative defaults.
 # Preserve Slurm's CUDA_VISIBLE_DEVICES; torchrun starts one process per GPU.
+echo "Model caches: HF_HOME=${HF_HOME}; HF_HUB_CACHE=${HF_HUB_CACHE}; TORCH_HOME=${TORCH_HOME}"
+echo "Hugging Face offline mode: ${HF_HUB_OFFLINE:-1} (pre-cache weights before submitting)"
 exec bash scripts/run_vlm_lora_q_bf16_calibration.sh

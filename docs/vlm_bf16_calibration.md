@@ -141,10 +141,22 @@ Required assets, **not included in the copied `work_dirs/vlm_delta` logs**:
   `cc594898137f460bfe9f0759e9844b3ce807cfb5`.
 - Cached weights for the three FD models and the independent ResNet-50 probe.
 
-The launcher defaults to `HF_HUB_OFFLINE=1`. Transfer/populate the model caches
-before submitting, and set `HF_HOME` and `TORCH_HOME` if using nondefault cache
-locations. A Hugging Face snapshot directory can contain symlinks into `blobs/`:
-copy the complete cache, or dereference symlinks when transferring the snapshot.
+The node-specific wrapper uses these shared cache defaults, matching the older
+GRASP launcher. Exported values override them:
+
+| Variable | Default |
+|---|---|
+| `HF_HOME` | `/mnt/projects/jg/kaifany/.hf` |
+| `HF_HUB_CACHE` | `${HF_HOME}/hub` |
+| `TORCH_HOME` | `/mnt/projects/jg/kaifany/.torch` |
+| `HF_HUB_OFFLINE` | `1` |
+
+Populate the same caches with the same Python environment before submitting.
+`HF_HUB_OFFLINE=1` disables Hugging Face downloads; it does not disable
+`torch.hub` or torchvision weight downloads, and is not a complete asset
+availability check. A Hugging Face snapshot directory can contain symlinks
+into `blobs/`: copy the complete cache, or dereference symlinks when transferring
+the snapshot.
 
 The p head stores an absolute Qwen path from its original machine. If that path
 differs on the destination, create a relocated copy **on the destination**:
@@ -165,6 +177,61 @@ revision mismatches. It does not verify weight bytes. Use the same model
 revision, prompt, and layer as the original head. This new p-head identity is
 for the fresh run; do not resume an old generator run against a relocated head.
 
+### Missing SigLIP cache files
+
+Job 558793 stopped with `LocalEntryNotFoundError` while loading the timm SigLIP
+FD model before training. The requested Hugging Face files were absent from the
+cache being used and could not be retrieved. The launcher defaults to offline
+mode unless overridden. This is not evidence of a BF16 arithmetic failure or a
+CUDA out-of-memory failure. Selecting the shared cache can resolve
+a cache-path mismatch; genuinely missing files must be downloaded or copied.
+
+Copy the updated `scripts/cache_fd_models.sh` to the server first. On a
+network-enabled login/CPU session, the script loads each actual FD model on CPU
+in sequence, releases it, and then loads the held-out ResNet-50 probe. No GPU
+allocation is required. If the earlier foreground warmup is still running,
+interrupt it and wait for that process to exit before starting another copy.
+
+Run the script in the background and follow its output:
+
+```bash
+cd /mnt/projects/jg/kaifany/conditional_fd_loss
+mkdir -p logs
+nohup bash scripts/cache_fd_models.sh > logs/cache_fd_models.log 2>&1 < /dev/null &
+cache_pid=$!
+printf '%s\n' "$cache_pid" > logs/cache_fd_models.pid
+tail -n 50 -f logs/cache_fd_models.log
+```
+
+Ctrl+C stops `tail` without stopping the background cache process. The log is
+overwritten when this command is launched again; preserve it under another
+name first if needed. After reconnecting, use the same `tail` command to follow
+the log. Completion is marked by:
+
+```text
+SUCCESS: FD models and probe cached successfully.
+```
+
+The script prints immediately from Bash, then logs each Python import and model
+load. Once Python's diagnostic timer starts, it prints one stack dump if a
+stage takes longer than 120 seconds; the timer resets for each stage. These
+diagnostic traces identify where Python is working or waiting; they are not
+themselves a failure. Set `CACHE_TRACEBACK_SECONDS` to change this per-stage
+timeout, or `0` to disable it. To
+diagnose only the imports/setup without loading or downloading models, use
+`bash scripts/cache_fd_models.sh --imports-only` (or add `--imports-only` to the
+`nohup` command). `--help` lists the options.
+
+The defaults match the training job: `PY_BIN=<repo>/.venv/bin/python`,
+`HF_HOME=/mnt/projects/jg/kaifany/.hf`, `HF_HUB_CACHE=${HF_HOME}/hub`, and
+`TORCH_HOME=/mnt/projects/jg/kaifany/.torch`; exported values override them.
+The script uses two CPU threads and sets `HF_HUB_OFFLINE=0` only inside its own
+process. The training wrapper continues to default to `HF_HUB_OFFLINE=1`.
+This prepares FD/probe weights only: Qwen still requires the recorded snapshot
+and processor/tokenizer files listed above, with the same p-head identity and
+model revision. A successful cache check does not establish that a subsequent
+GPU training run succeeds.
+
 ## Preview and submit the active six-GPU run
 
 Set destination paths once in the shell used to call `sbatch`:
@@ -178,9 +245,10 @@ export START_CKPT=/path/to/JiT-B-uncond.pth
 export STATS_DIR=/path/to/imagenet100_v1
 export P_HEAD=/path/to/p_head_local.pt
 export EXP_NAME=qwen_lora_fullbf16_blackwell_b48_15k_vis1500_v1
-# If needed:
-export HF_HOME=/path/to/huggingface/cache
-export TORCH_HOME=/path/to/torch/cache
+# Match the shared caches populated above and used by the node wrapper.
+export HF_HOME="${HF_HOME:-/mnt/projects/jg/kaifany/.hf}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export TORCH_HOME="${TORCH_HOME:-/mnt/projects/jg/kaifany/.torch}"
 
 # Exercise the Slurm wrapper's defaults without allocating GPUs or writing files.
 DRY_RUN=1 SLURM_JOB_ID=preview SLURM_SUBMIT_DIR="$PWD" \
