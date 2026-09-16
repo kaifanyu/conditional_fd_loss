@@ -1,5 +1,12 @@
 # Learnable Qwen q with LoRA
 
+For the current BF16 calibration preset with BF16 generator/FD neural compute,
+BF16 trainable parameters and AdamW moments, fixed VJP/q loss scaling, and a
+portable Slurm launcher, see [BF16 calibration on Slurm](vlm_bf16_calibration.md).
+That preset has no FP32 master weights or FP32 parameter updates. FD matrix
+statistics/eigensolve remain FP64, and log-probability/image-VJP reductions
+remain FP32. Classifier feature normalization follows the BF16 parameter dtype.
+
 The existing entry point `conditional_main_fd_vlm_delta.py` now accepts
 `--vlm_q_lora`. This mode supports p checkpoints with
 `vlm_backend=qwen_answer_state`. The default, without the flag, retains the
@@ -121,7 +128,8 @@ run is not a pure capacity ablation.
 
 Student loss is the mean sampled-label cross entropy. Every rank trains on its
 own equally sized image shard, accumulates microbatch gradients using the full
-local batch denominator, then averages FP32 parameter gradients across ranks.
+local batch denominator, then averages parameter gradients across ranks in
+their storage dtype (`--parameter_dtype`, FP32 by default; BF16 in the preset).
 The random adapter initialization is broadcast from rank zero; the existing
 rank-dependent seeds otherwise produce different A matrices. Head and adapter
 optimizer groups have separate learning rates and weight decay.
@@ -177,8 +185,9 @@ changed with `--vlm_q_lora_targets`. Only matching Linear modules in eligible
 vision/decoder blocks are wrapped; convolutional patch embedding and LM output
 head are not adapted. Default targets do not include MLPs or the visual merger.
 
-Use the existing 100-class launcher with a **Qwen** p checkpoint. For example,
-after replacing the checkpoint path and GPU selection for your environment:
+Use the existing 100-class launcher with a **Qwen** p checkpoint. The current
+BF16 preset is `scripts/run_vlm_lora_q_bf16_calibration.sh`. For an independent
+FP32 reference smoke run, replace the paths/GPU selection in this example:
 
 ```bash
 cd /mnt/projects/jg/kaifany/conditional_fd_loss
@@ -332,22 +341,50 @@ the LoRA path. Scaling the final generator loss would be too late to repair
 the VLM backward: its VJP has already been computed and detached.
 
 For student updates, `--vlm_q_loss_scale S` in LoRA mode scales CE before
-backward, then divides every FP32 parameter gradient by S before all-reduce,
+backward, then divides every parameter gradient by S before all-reduce,
 clipping, and the optimizer. Both scale defaults are 1. These are fixed scales
 for controlled experiments; non-finite gradients abort rather than silently
 changing the scale. This is not a dynamic GradScaler implementation.
+Parameter gradients retain the configured storage dtype, including BF16 for
+the full-BF16 preset.
 
 Changing `--vlm_delta_weight` without unscaling changes the objective's
 strength. It is a separate intervention. Loss magnitude alone does not measure
 gradient fidelity. In particular, a small `log q - log p` can simply reflect
 successful p initialization or cancellation, not underflow.
 
-Keep heads, feature normalization, log probabilities, adapters, EMA, image
-leaves and unscaled gradient accumulation in FP32. The base compute/weight
-dtype is still controlled by `--vlm_dtype`; FP32 adapters cannot make a BF16
-base Jacobian equivalent to FP32. For a trustworthy comparison, load the base
-checkpoint directly in fp32 and disable TF32; casting an already-rounded BF16
-model to fp32 does not restore original weight information.
+The precision controls are independent:
+
+| Argument | What it controls | Full-BF16 preset |
+|---|---|---|
+| `--dtype` | Generator and FD feature-network neural autocast | `bf16` |
+| `--parameter_dtype` | Generator, FD-network, p/q-head, and LoRA parameter storage; trainable parameter gradients and AdamW moments | `bf16` |
+| `--vlm_dtype` | Frozen Qwen base weights and compute | `bf16` |
+
+`--parameter_dtype` defaults to `fp32` for other configurations. Selecting
+`bf16` removes FP32 parameter updates and FP32 master weights; any enabled
+parameter EMA uses the selected parameter dtype. It does not change FD moments
+and eigensolve (FP64), or log probabilities, image leaves and VJP accumulation
+(FP32). Classifier feature normalization follows the parameter dtype. These
+higher-precision reductions are numerical computations rather than FP32
+parameter updates. Native normalization/attention kernels can also internally
+accumulate in higher precision.
+
+BF16 parameter storage can round away optimizer increments that are small
+relative to the existing weight. Loss scaling is removed before the optimizer,
+so it does not correct this effect. Check actual parameter drift as well as
+finite gradients and losses when evaluating this configuration.
+
+The [original FD-Loss paper](https://arxiv.org/html/2604.28190) reports BF16
+precision, but its released code keeps FP64 FD statistics and default FP32
+model parameters, and lacks training autocast in `main_fd.py`. This BF16
+parameter-update configuration is therefore an explicit extension, not an
+exact reproduction; see [the source comparison](vlm_bf16_calibration.md#relationship-to-the-original-fd-loss-paper).
+
+For a precision reference comparison, load the base checkpoint directly in
+FP32 and disable TF32; casting an already-rounded BF16 model to FP32 does not
+restore original weight information. FP32 adapters alone cannot make a BF16
+base Jacobian equivalent to FP32.
 
 Use `scripts/check_vlm_gradient_precision.py` on saved representative images:
 
@@ -376,13 +413,14 @@ and investigate precision/kernels/cancellation rather than raising lambda.
 ## Pseudocode
 
 ```python
-E0 = load_qwen(dtype=fp32).eval().freeze_base_weights()
+E0 = load_qwen(dtype=vlm_dtype).eval().freeze_base_weights()
 Hp, normalization, T, class_map = load_real_data_p_checkpoint()
+Hp.to(dtype=parameter_dtype)            # includes feature normalization buffers
 Hp.freeze()
 Hs = deepcopy(Hp)
 Hs.enable_grad()
-As = kaiming_init(rank=8)
-Bs = zeros()
+As = kaiming_init(rank=8, dtype=parameter_dtype)
+Bs = zeros(dtype=parameter_dtype)
 broadcast_adapter_initialization_from_rank_zero()
 q_optimizer = AdamW([
     {"params": Hs.parameters(), "lr": head_lr, "weight_decay": head_decay},

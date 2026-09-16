@@ -104,16 +104,13 @@ source "${SCRIPT_DIR}/imagenet100_class_ids.sh"
 : "${DELTA_CLAMP:=0.0}"
 
 : "${FD_EMA_BETA:=0.99}"
-# The generator gradient is all-reduced with AVG while every rank computes the
-# loss over the globally gathered batch, so the applied gradient is 1/world_size
-# of the true one and the EFFECTIVE lr is LR/world_size (verified numerically at
-# W=1,2,3). Every GMM arm and both VLM-delta trials ran lr=1e-5; at 4 ranks that
-# is an effective 2.5e-6. Keep the EFFECTIVE value fixed when the rank count
-# changes -- at 3 ranks that means LR=7.5e-6, not 1e-5.
+# Keep the historical generator AdamW LR unless explicitly overridden.
+# Averaging gradients across ranks does not make AdamW's effective LR equal
+# to LR/world_size: its moment normalization also depends on gradient scale.
 : "${LR:=1e-5}"
 : "${EPOCHS:=40}"
 : "${STEPS_PER_EPOCH:=1250}"   # 40 x 1250 = 50,000 steps = 48,000 samples/class
-: "${BATCH_SIZE:=24}"          # per GPU; 24 x 4 = global 96, do not change
+: "${BATCH_SIZE:=24}"          # per GPU; default 24 x 4 = global 96
 : "${QUEUE_SIZE:=50000}"
 : "${NUM_EVAL_IMAGES:=50000}"
 : "${EVAL_FREQ:=4}"            # 4 * 1250 = every 5,000 steps
@@ -124,6 +121,10 @@ source "${SCRIPT_DIR}/imagenet100_class_ids.sh"
 : "${DISABLE_VIS:=0}"
 : "${AUTO_RESUME:=0}"
 : "${RUN_FOREGROUND:=0}"
+# Slurm may supply physical IDs or GPU UUIDs. Keep its visibility mapping when
+# requested; GPUS then only enumerates logical ranks for the batch calculation.
+: "${PRESERVE_CUDA_VISIBLE_DEVICES:=0}"
+: "${DRY_RUN:=0}"
 # RESUME=1 continues an existing EXP_NAME from its newest checkpoint instead of
 # refusing to touch an existing work dir. Everything -- generator, EMA,
 # optimizer, FD queues, q student/teacher, q optimizer and the q replay buffer --
@@ -202,6 +203,8 @@ is_bool "${DISABLE_VIS}" || die "DISABLE_VIS must be 0 or 1"
 is_bool "${AUTO_RESUME}" || die "AUTO_RESUME must be 0 or 1"
 is_bool "${RESUME}" || die "RESUME must be 0 or 1"
 is_bool "${RUN_FOREGROUND}" || die "RUN_FOREGROUND must be 0 or 1"
+is_bool "${PRESERVE_CUDA_VISIBLE_DEVICES}" || die "PRESERVE_CUDA_VISIBLE_DEVICES must be 0 or 1"
+is_bool "${DRY_RUN}" || die "DRY_RUN must be 0 or 1"
 is_bool "${CALIBRATION}" || die "CALIBRATION must be 0 or 1"
 is_bool "${Q_LORA}" || die "Q_LORA must be 0 or 1"
 is_bool "${Q_USE_EMA}" || die "Q_USE_EMA must be 0 or 1"
@@ -258,13 +261,19 @@ ${TAKEOFF_GATE_STEP}, but this run is only ${TOTAL_STEPS} steps
 (${SAMPLES_PER_CLASS_AT_END} samples/class at global batch ${GLOBAL_BATCH})."
 fi
 
-(( GLOBAL_BATCH == 96 )) || echo "WARNING: global batch is ${GLOBAL_BATCH}, not the 96 \
-every samples-per-class number in docs/gmm.md is defined against."
+(( GLOBAL_BATCH == 96 )) || echo "NOTE: global batch is ${GLOBAL_BATCH}; sample counts below are computed for this batch."
 
+if [[ "${DRY_RUN}" == "1" ]]; then
+    # Preview needs neither CUDA nor checkpoints. Actual launches always perform
+    # the p-head precheck below and the trainer's full representation validation.
+    P_HEAD_BACKEND=$([[ "${Q_LORA}" == "1" ]] && echo qwen_answer_state || echo timm)
+else
 [[ -x "${PY_BIN}" ]] || die "Python executable not found: ${PY_BIN}"
 [[ -f conditional_main_fd_vlm_delta.py ]] || die "missing entry point: conditional_main_fd_vlm_delta.py"
 [[ -d "${DATA_PATH}/train" ]] || die "ImageNet train split not found: ${DATA_PATH}/train"
-[[ -f "${START_CKPT}" ]] || die "unconditional JiT-B checkpoint not found: ${START_CKPT}"
+if [[ "${RESUME}" == "0" ]]; then
+    [[ -f "${START_CKPT}" ]] || die "unconditional JiT-B checkpoint not found: ${START_CKPT}"
+fi
 [[ -f "${P_HEAD}" ]] || die "frozen p-head checkpoint not found: ${P_HEAD}
 Run first:
   CUDA_VISIBLE_DEVICES=... ${PY_BIN} -m torch.distributed.run --standalone \\
@@ -317,17 +326,25 @@ print(f"p head OK [{backend}]: {ckpt['num_classes']}-way on "
 print(backend)
 PYEOF
 )" || die "p-head precheck failed"
+fi
 if [[ "${Q_LORA}" == "1" && "${P_HEAD_BACKEND}" != "qwen_answer_state" ]]; then
     die "Q_LORA=1 requires a Qwen answer-state P_HEAD"
 fi
 
 RUN_DIR="${OUTPUT_DIR}/${PROJECT}/${EXP_NAME}"
-mkdir -p "${LOG_DIR}"
 LOG_PATH="${LOG_DIR}/${EXP_NAME}.out"
-if [[ "${RESUME}" == "1" ]]; then
+if [[ "${DRY_RUN}" == "1" ]]; then
+    RESUME_STEP=preview
+elif [[ "${RESUME}" == "1" ]]; then
     [[ -d "${RUN_DIR}/checkpoints" ]] \
         || die "RESUME=1 but no checkpoints under ${RUN_DIR}"
-    LATEST_CKPT="$(ls -t "${RUN_DIR}"/checkpoints/step_*.pth 2>/dev/null | head -1)"
+    LATEST_CKPT=""
+    for candidate in "${RUN_DIR}"/checkpoints/step_*.pth; do
+        [[ -f "${candidate}" ]] || continue
+        if [[ -z "${LATEST_CKPT}" || "${candidate}" -nt "${LATEST_CKPT}" ]]; then
+            LATEST_CKPT="${candidate}"
+        fi
+    done
     [[ -n "${LATEST_CKPT}" ]] || die "RESUME=1 but no step_*.pth in ${RUN_DIR}/checkpoints"
     RESUME_STEP="$(basename "${LATEST_CKPT}" .pth | sed 's/step_0*//')"
 else
@@ -434,11 +451,13 @@ MODE_LABEL=$([[ "${CALIBRATION}" == "1" ]] && echo "WEIGHT CALIBRATION" \
 echo "Experiment:       ${PROJECT}/${EXP_NAME} (${MODE_LABEL})"
 echo "Objective:        L_FD + ${WEIGHT} * E[log q(c|x) - log p(c|x)]"
 echo "GPUs:             ${GPUS} (${NPROC_PER_NODE} ranks)"
-EFF_LR=$(awk -v l="${LR}" -v w="${NPROC_PER_NODE}" 'BEGIN{printf "%.4g", l/w}')
 echo "Batch:            ${BATCH_SIZE}/GPU, global ${GLOBAL_BATCH}"
-echo "LR:               ${LR} over ${NPROC_PER_NODE} ranks -> effective ${EFF_LR}/step"
+echo "LR:               ${LR} (generator AdamW; ${NPROC_PER_NODE} ranks)"
 echo "Classes:          ${NUM_TRAIN_CLASSES} (${CLASS_IDS[0]} ${CLASS_IDS[1]} ... ${CLASS_IDS[-1]}), stride-10 subset"
 echo "Iterations:       ${TOTAL_STEPS} = ${SAMPLES_PER_CLASS_AT_END} samples/class"
+if [[ "${DISABLE_VIS}" == "0" ]]; then
+    echo "Visualization:    initial grid and every $(( VIS_FREQ * STEPS_PER_EPOCH )) steps; ${#VIS_CLASSES[@]} classes, online + EMA"
+fi
 if [[ "${P_HEAD_BACKEND}" == "qwen_answer_state" ]]; then
     if [[ "${Q_LORA}" == "1" ]]; then
         echo "VLM:              Qwen2.5-VL frozen base + trainable q LoRA adapters"
@@ -449,7 +468,7 @@ if [[ "${P_HEAD_BACKEND}" == "qwen_answer_state" ]]; then
     fi
     echo "                  (microbatch ${VLM_MICROBATCH}, ${VLM_DTYPE}, samples/rank/step \
 ${VLM_SAMPLES_PER_STEP:-all}). Check s/step in the first 50 log lines before"
-    echo "                  committing. LoRA and fp32 require fresh timing/memory measurements."
+    echo "                  committing. This precision configuration requires fresh timing/memory measurements."
 else
     echo "VLM:              ${FD_MODELS[0]} (judge '${VLM_JUDGE}', pool ${FD_POOLS[0]}, ${FD_SIZES[0]}px) -- FROZEN"
 fi
@@ -497,10 +516,18 @@ printf 'Command:'
 printf ' %q' "${CMD[@]}"
 printf '\n'
 
+if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "Dry run: command only; no files created or GPU processes started."
+    exit 0
+fi
+mkdir -p "${LOG_DIR}"
+if [[ "${PRESERVE_CUDA_VISIBLE_DEVICES}" == "0" ]]; then
+    export CUDA_VISIBLE_DEVICES="${GPUS}"
+fi
 if [[ "${RUN_FOREGROUND}" == "1" ]]; then
-    CUDA_VISIBLE_DEVICES="${GPUS}" "${CMD[@]}" 2>&1 | tee -a "${LOG_PATH}"
+    "${CMD[@]}" 2>&1 | tee -a "${LOG_PATH}"
 else
-    CUDA_VISIBLE_DEVICES="${GPUS}" setsid "${CMD[@]}" \
+    setsid "${CMD[@]}" \
         >>"${LOG_PATH}" 2>&1 < /dev/null &
     pid=$!
     echo "Started PID ${pid}. Follow with: tail -f ${LOG_PATH}"

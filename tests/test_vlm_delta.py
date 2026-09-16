@@ -650,6 +650,57 @@ class TrainScriptLogicTest(unittest.TestCase):
         )
         self.mod = sys.modules["conditional_main_fd_vlm_delta"]
 
+    def test_instant_metrics_stay_instant_after_nondiagnostic_resume(self):
+        import json
+
+        from utils.logging_util import MetricLogger
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "metrics.jsonl")
+            metrics = MetricLogger(output_file=path)
+            # Resume at step 436, before the next diagnostic at step 440.
+            self.mod.update_training_metrics(
+                metrics, self.mod.INSTANT_METERS,
+                loss=3.0, vlm_logp_c=-10.0)
+            metrics.dump_in_output_file(436, 1.0, 0.0)
+            for step, ratio in ((440, 0.07), (450, 0.5)):
+                self.mod.update_training_metrics(
+                    metrics, self.mod.INSTANT_METERS,
+                    loss=2.0, grad_ratio_vlm_fd=ratio, q_train_steps=step + 1)
+                metrics.dump_in_output_file(step, 1.0, 0.0)
+            with open(path) as f:
+                rows = [json.loads(line) for line in f]
+
+        self.assertNotIn("grad_ratio_vlm_fd", rows[0])
+        self.assertAlmostEqual(rows[-1]["grad_ratio_vlm_fd"], 0.5)
+        self.assertEqual(rows[-1]["q_train_steps"], 451)
+        self.assertEqual(metrics.meters["grad_ratio_vlm_fd"].deque.maxlen, 1)
+        self.assertEqual(metrics.meters["loss"].deque.maxlen, 20)
+
+    def test_unproduced_instant_metrics_do_not_create_empty_windows(self):
+        from utils.logging_util import MetricLogger
+
+        metrics = MetricLogger()
+        self.mod.update_training_metrics(
+            metrics, self.mod.INSTANT_METERS,
+            loss=3.0, grad_x_fd=None, vlm_logq_c=-4.6)
+        self.assertNotIn("grad_x_fd", metrics.meters)
+        self.assertNotIn("q_buffer_size", metrics.meters)
+        self.assertNotIn("q_teacher_weight_delta_l2", metrics.meters)
+        self.assertIn("vlm_logq_c", str(metrics))
+
+    def test_backend_instant_metrics_keep_latest_value(self):
+        from utils.logging_util import MetricLogger
+
+        metrics = MetricLogger()
+        names = list(self.mod.INSTANT_METERS)
+        for backend_names in self.mod.BACKEND_INSTANT_METERS.values():
+            names.extend(backend_names)
+        for value in (24.0, 12.0, 48.0):
+            self.mod.update_training_metrics(
+                metrics, names, vlm_answer_state_samples=value)
+        self.assertEqual(metrics.meters["vlm_answer_state_samples"].median, 48.0)
+
     def test_scale_schedule(self):
         from argparse import Namespace
         args = Namespace(vlm_delta_weight=0.4, vlm_delta_warmup_steps=100,
@@ -716,12 +767,7 @@ class TrainScriptLogicTest(unittest.TestCase):
         self.assertIsNone(args.vlm_head_temperature)         # taken from the p head
 
     def test_backend_specific_meters_are_not_registered_unconditionally(self):
-        """A registered-but-never-updated meter crashes logging at the first print.
-
-        MetricLogger.__str__ calls max() on the meter's window; an empty deque
-        raises ValueError, which killed a resumed run at its first print once the
-        Qwen backend's meters were added to the unconditional tuple.
-        """
+        """Declare backend-only diagnostics separately from shared metrics."""
         unconditional = set(self.mod.INSTANT_METERS)
         for backend, names in self.mod.BACKEND_INSTANT_METERS.items():
             overlap = unconditional.intersection(names)

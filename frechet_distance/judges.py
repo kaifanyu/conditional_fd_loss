@@ -5,6 +5,7 @@ checkpoint save/load, and sanity checks.
 """
 
 import logging
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -41,7 +42,11 @@ def extract_judge_features(judge, images):
     we want the mean_token as features.  Inception and CNN models use primary
     features.
     """
-    primary, secondary = judge["model"](images)
+    amp_dtype = judge.get("amp_dtype")
+    context = (torch.autocast(images.device.type, dtype=amp_dtype)
+               if amp_dtype is not None else nullcontext())
+    with context:
+        primary, secondary = judge["model"](images)
     if judge.get("pool_type") == "avg":
         return secondary
     return primary
@@ -157,7 +162,12 @@ def fill_all_queues(judges, model, args, tokenizer=None, gmm_judge=None,
                 0, train_class_ids_tensor.numel(), (batch_size,), device="cuda",
             )
             y = train_class_ids_tensor[subset_indices]
-        imgs = model.generate(batch_size, y, cfg=args.cfg, args=args, verbose=False)
+        # Opt-in for the VLM trainer; legacy entry points keep their fill path.
+        amp_dtype = getattr(args, "training_amp_dtype", None)
+        context = (torch.autocast(y.device.type, dtype=amp_dtype)
+                   if amp_dtype is not None else nullcontext())
+        with context:
+            imgs = model.generate(batch_size, y, cfg=args.cfg, args=args, verbose=False)
         if tokenizer is not None:
             imgs = tokenizer.detokenize(imgs) # [0, 1]
         else:

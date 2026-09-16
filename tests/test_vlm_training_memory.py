@@ -6,6 +6,7 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 from conditional_main_fd_vlm_delta import training_generated_images, training_judge_features
+from frechet_distance.judges import extract_judge_features
 
 
 class FrozenJudge(torch.nn.Module):
@@ -34,6 +35,104 @@ class TinyGenerator(torch.nn.Module):
 
 
 class TrainingMemoryTest(unittest.TestCase):
+    def test_judge_precision_applies_to_queue_fill_and_training(self):
+        judge = {"model": FrozenJudge(11).to(dtype=torch.bfloat16),
+                 "pool_type": "cls", "amp_dtype": torch.bfloat16}
+        images = torch.rand(5, 3, 4, 4, requires_grad=True)
+        # Queue fill calls extract_judge_features directly, without an AMP
+        # argument or an outer autocast scope. It must share training precision.
+        with torch.no_grad():
+            queue_features = extract_judge_features(judge, images)
+        train_features = training_judge_features(
+            judge, images, microbatch=2, checkpoint_features=True)
+        self.assertEqual(queue_features.dtype, torch.bfloat16)
+        self.assertEqual(train_features.dtype, torch.bfloat16)
+        torch.testing.assert_close(train_features, queue_features, rtol=0.02, atol=0.004)
+        train_features.double().square().sum().backward()
+        self.assertTrue(torch.isfinite(images.grad).all())
+        self.assertGreater(float(images.grad.norm()), 0)
+        self.assertTrue(all(p.grad is None for p in judge["model"].parameters()))
+
+    def test_bf16_generator_and_judges_preserve_checkpointed_gradients(self):
+        torch.manual_seed(31)
+        generator = TinyGenerator().to(dtype=torch.bfloat16)
+        small_generator = copy.deepcopy(generator)
+        compute_dtypes = []
+        for model in (generator, small_generator):
+            model.layer.register_forward_hook(
+                lambda _module, _inputs, output: compute_dtypes.append(output.dtype))
+        judge = {"model": FrozenJudge(7).to(dtype=torch.bfloat16), "pool_type": "cls"}
+        # Float inputs deliberately exercise autocast at both model boundaries.
+        noise = torch.rand(5, 3, 4, 4)
+        labels = torch.tensor([0, 1, 2, 1, 0])
+        reference = training_generated_images(
+            generator, noise, labels, {}, amp_dtype=torch.bfloat16)
+        images = training_generated_images(
+            small_generator, noise, labels, {}, microbatch=2,
+            checkpoint_generator=True, amp_dtype=torch.bfloat16)
+        # Model arithmetic is BF16; the returned image leaf is FP32 for VJPs.
+        self.assertEqual(reference.dtype, torch.float32)
+        self.assertEqual(images.dtype, torch.float32)
+        torch.testing.assert_close(images, reference, rtol=0.02, atol=0.004)
+        ref_features = training_judge_features(
+            judge, reference.float(), amp_dtype=torch.bfloat16)
+        features = training_judge_features(
+            judge, images.float(), microbatch=2, checkpoint_features=True,
+            amp_dtype=torch.bfloat16)
+        self.assertEqual(features.dtype, torch.bfloat16)
+        torch.testing.assert_close(features, ref_features, rtol=0.02, atol=0.004)
+        # FD accumulates statistics above BF16 precision after feature extraction.
+        # Keep this batch-coupled loss global to detect accidental per-chunk loss.
+        ref_features, features = ref_features.double(), features.double()
+        ref_loss = ref_features.mean(0).square().sum() + ref_features.var(0).sum()
+        loss = features.mean(0).square().sum() + features.var(0).sum()
+        expected = torch.autograd.grad(ref_loss, reference, retain_graph=True)[0]
+        actual = torch.autograd.grad(loss, images, retain_graph=True)[0]
+        torch.testing.assert_close(actual, expected, rtol=0.04, atol=0.0003)
+        ref_loss.backward()
+        loss.backward()
+        for a, b in zip(generator.parameters(), small_generator.parameters()):
+            self.assertEqual(b.grad.dtype, torch.bfloat16)
+            self.assertTrue(torch.isfinite(b.grad).all())
+            torch.testing.assert_close(b.grad, a.grad, rtol=0.04, atol=0.0003)
+        self.assertGreater(sum(float(p.grad.float().norm())
+                               for p in small_generator.parameters()), 0)
+        self.assertTrue(all(p.grad is None for p in judge["model"].parameters()))
+        self.assertGreater(len(small_generator.forward_sizes), 3)
+        self.assertLessEqual(max(small_generator.forward_sizes), 2)
+        self.assertTrue(compute_dtypes)
+        self.assertEqual(set(compute_dtypes), {torch.bfloat16})
+
+    def test_bf16_adamw_updates_use_bf16_parameters_and_moments(self):
+        torch.manual_seed(43)
+        generator = TinyGenerator().to(dtype=torch.bfloat16)
+        judge = {"model": FrozenJudge(5).to(dtype=torch.bfloat16), "pool_type": "avg"}
+        optimizer = torch.optim.AdamW(generator.parameters(), lr=0.02)
+        before = [p.detach().clone() for p in generator.parameters()]
+        noise = torch.rand(5, 3, 4, 4)
+        labels = torch.tensor([0, 1, 2, 1, 0])
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            images = training_generated_images(
+                generator, noise, labels, {}, microbatch=2,
+                checkpoint_generator=True, amp_dtype=torch.bfloat16)
+            features = training_judge_features(
+                judge, images, microbatch=2, checkpoint_features=True,
+                amp_dtype=torch.bfloat16)
+            features.double().mean(0).square().sum().backward()
+            optimizer.step()
+        self.assertTrue(any(not torch.equal(p, old)
+                            for p, old in zip(generator.parameters(), before)))
+        for p in generator.parameters():
+            self.assertEqual(p.dtype, torch.bfloat16)
+            self.assertEqual(p.grad.dtype, torch.bfloat16)
+            self.assertTrue(torch.isfinite(p).all())
+            state = optimizer.state[p]
+            self.assertEqual(int(state["step"]), 2)
+            for key in ("exp_avg", "exp_avg_sq"):
+                self.assertEqual(state[key].dtype, torch.bfloat16)
+                self.assertTrue(torch.isfinite(state[key]).all())
+
     def test_generator_microbatch_bounds_recompute_and_preserves_global_loss(self):
         generator = TinyGenerator()
         small_generator = copy.deepcopy(generator)

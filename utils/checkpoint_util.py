@@ -146,6 +146,12 @@ def ckpt_resume(
         if args.resume_from and os.path.exists(args.resume_from):
             logger.info(f"[Model-resume] Resuming from: {args.resume_from}")
             checkpoint = torch.load(args.resume_from, map_location="cpu", weights_only=False)
+            if hasattr(args, "parameter_dtype"):
+                saved_dtype = checkpoint.get("parameter_dtype", "fp32")
+                if saved_dtype != args.parameter_dtype:
+                    raise ValueError(
+                        f"Cannot resume parameter_dtype={saved_dtype} as {args.parameter_dtype}; "
+                        "use --load_from for a fresh precision experiment")
             msg = _load_model_sd(model, checkpoint["model"])
             logger.info(f"[Model-resume] Loaded model: {msg}")
 
@@ -289,6 +295,8 @@ def save_checkpoint(
         "current_step": args.current_step,
         "samples_seen": args.samples_seen,
     }
+    if hasattr(args, "parameter_dtype"):
+        checkpoint_data["parameter_dtype"] = args.parameter_dtype
     if extra is not None:
         checkpoint_data.update(extra)
     checkpoint_path = os.path.join(args.ckpt_dir, f"step_{step:07d}.pth")

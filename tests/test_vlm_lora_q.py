@@ -15,7 +15,7 @@ from vlm_lora_q import (LoRAQ, build_lora_optimizer, load_q_optimizer_state,
 
 
 class TinyExtractor(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, compute_dtype=torch.float32):
         super().__init__()
         self.vlm = torch.nn.Module()
         self.vlm.visual = torch.nn.Module()
@@ -23,9 +23,9 @@ class TinyExtractor(torch.nn.Module):
         self.vlm.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(2)])
         for layer in self.vlm.layers:
             layer.q_proj = torch.nn.Linear(6, 6)
-        self.vlm.requires_grad_(False)
+        self.vlm.to(dtype=compute_dtype).requires_grad_(False)
         self.layer = 1
-        self.compute_dtype = torch.float32
+        self.compute_dtype = compute_dtype
         self.microbatch_size = 2
         self.max_samples_per_step = 0
         self.register_buffer("_sample_cursor", torch.zeros((), dtype=torch.long))
@@ -33,16 +33,16 @@ class TinyExtractor(torch.nn.Module):
     select_indices = QwenAnswerStateExtractor.select_indices
 
     def answer_states(self, images):
-        z = self.vlm.visual.proj(images.mean((-2, -1))).tanh()
+        z = self.vlm.visual.proj(images.mean((-2, -1)).to(self.compute_dtype)).tanh()
         z = self.vlm.layers[0].q_proj(z).tanh()
         return {self.layer: z}
 
 
-def make_system():
+def make_system(parameter_dtype=torch.float32, compute_dtype=torch.float32):
     torch.manual_seed(123)
-    extractor = TinyExtractor()
-    heads = VLMDeltaHeads(VLMLinearHead(6, 3), ema_beta=0.6)
-    lora = LoRAQ(extractor, heads, rank=2, alpha=4)
+    extractor = TinyExtractor(compute_dtype=compute_dtype)
+    heads = VLMDeltaHeads(VLMLinearHead(6, 3), ema_beta=0.6).to(dtype=parameter_dtype)
+    lora = LoRAQ(extractor, heads, rank=2, alpha=4, parameter_dtype=parameter_dtype)
     return extractor, heads, lora
 
 
@@ -195,6 +195,103 @@ class LoRAQTest(unittest.TestCase):
             actual = self.heads.p_log_probs(z)
         self.assertEqual(actual.dtype, torch.float32)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_bf16_head_normalizes_and_multiplies_in_bf16(self):
+        head = VLMLinearHead(6, 3).to(dtype=torch.bfloat16)
+        z = torch.randn(4, 6, requires_grad=True)
+        observed = []
+        handle = head.linear.register_forward_hook(
+            lambda module, inputs, output: observed.append((inputs[0].dtype, output.dtype)))
+        try:
+            logits = head.logits(z, temperature=0.9)
+        finally:
+            handle.remove()
+        self.assertEqual(observed, [(torch.bfloat16, torch.bfloat16)])
+        self.assertEqual(head.feature_mean.dtype, torch.bfloat16)
+        self.assertEqual(head.feature_std.dtype, torch.bfloat16)
+        self.assertEqual(logits.dtype, torch.float32)
+        self.assertEqual(head.log_probs(z).dtype, torch.float32)
+        logits.square().sum().backward()
+        self.assertEqual(head.weight.grad.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(z.grad).all())
+        self.assertGreater(float(z.grad.norm()), 0)
+
+    def test_bf16_parameters_optimizer_updates_and_image_vjp(self):
+        extractor, heads, lora = make_system(torch.bfloat16, torch.bfloat16)
+        heads.use_ema = False
+        p_before = lora.log_probs(self.x, "base", 2)
+        torch.testing.assert_close(lora.log_probs(self.x, "student", 2), p_before, rtol=0, atol=0)
+        initial, _, _, _ = lora.generator_surrogate(self.x, self.y, denominator=5)
+        torch.testing.assert_close(initial, torch.zeros_like(initial), rtol=0, atol=0)
+        torch.testing.assert_close(torch.autograd.grad(initial, self.x)[0],
+                                   torch.zeros_like(self.x), rtol=0, atol=0)
+        p_state = {key: value.clone() for key, value in heads.p_head.state_dict().items()}
+        frozen_base = {key: value.clone() for key, value in extractor.state_dict().items()
+                       if ".base." in key}
+        head_before = heads.q_student.weight.detach().clone()
+        args = train_args(vlm_q_updates_per_step=2, vlm_q_loss_scale=1024.0)
+        optimizer = build_lora_optimizer(lora, args)
+        metrics = q_lora_update_step(lora, optimizer, self.x, self.y, args, True)
+        self.assertEqual(metrics["q_updates_applied"], 2)
+        self.assertGreater(metrics["q_student_lora_delta_l2"], 0)
+        self.assertTrue(all(p.dtype == torch.bfloat16 for p in lora.trainable_parameters()))
+        for state in optimizer.state.values():
+            self.assertEqual(state["exp_avg"].dtype, torch.bfloat16)
+            self.assertEqual(state["exp_avg_sq"].dtype, torch.bfloat16)
+        self.assertFalse(torch.equal(heads.q_student.weight, head_before))
+        for layer in lora.layers.values():
+            self.assertGreater(float(layer.student_b.float().norm()), 0)
+        for key, value in p_state.items():
+            torch.testing.assert_close(heads.p_head.state_dict()[key], value, rtol=0, atol=0)
+        for key, value in frozen_base.items():
+            torch.testing.assert_close(extractor.state_dict()[key], value, rtol=0, atol=0)
+        torch.testing.assert_close(lora.log_probs(self.x, "base", 2), p_before, rtol=0, atol=0)
+        self.assertIsNone(self.x.grad)
+        surrogate, _, logq, _ = lora.generator_surrogate(
+            self.x, self.y, denominator=5, loss_scale=1024.0)
+        gradient = torch.autograd.grad(surrogate, self.x)[0]
+        self.assertEqual(logq.dtype, torch.float32)
+        self.assertTrue(torch.isfinite(gradient).all())
+        self.assertGreater(float(gradient.norm()), 0)
+        self.assertTrue(all(p.grad is None for p in extractor.parameters()))
+        self.assertTrue(all(p.grad is None for p in heads.parameters()))
+
+    def test_precision_checkpoints_restore_and_reject_mismatch(self):
+        _, heads, lora = make_system(parameter_dtype=torch.bfloat16)
+        args = train_args()
+        optimizer = build_lora_optimizer(lora, args)
+        q_lora_update_step(lora, optimizer, self.x, self.y, args)
+        saved_lora = lora.state_dict()
+        saved_heads = copy.deepcopy(heads.q_state_dict())
+        saved_optimizer = copy.deepcopy(optimizer.state_dict())
+        self.assertEqual(saved_lora["config"]["parameter_dtype"], "torch.bfloat16")
+        self.assertEqual(saved_heads["parameter_dtype"], "torch.bfloat16")
+        _, restored_heads, restored_lora = make_system(parameter_dtype=torch.bfloat16)
+        restored_lora.load_state_dict(saved_lora)
+        restored_heads.load_q_state_dict(saved_heads)
+        restored_optimizer = build_lora_optimizer(restored_lora, args)
+        load_q_optimizer_state(restored_optimizer, saved_optimizer)
+        for model, opt in ((lora, optimizer), (restored_lora, restored_optimizer)):
+            q_lora_update_step(model, opt, self.x, self.y, args)
+        for a, b in zip(lora.trainable_parameters(), restored_lora.trainable_parameters()):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        with self.assertRaisesRegex(ValueError, "configuration"):
+            self.lora.load_state_dict(saved_lora)
+        with self.assertRaisesRegex(ValueError, "dtype"):
+            self.heads.load_q_state_dict(saved_heads)
+        with self.assertRaisesRegex(ValueError, "dtype"):
+            load_q_optimizer_state(build_lora_optimizer(self.lora, args), saved_optimizer)
+        with self.assertRaisesRegex(ValueError, "configuration"):
+            lora.load_state_dict(self.lora.state_dict())
+        with self.assertRaisesRegex(ValueError, "dtype"):
+            heads.load_q_state_dict(self.heads.q_state_dict())
+        # Legacy checkpoints omit parameter_dtype; an explicit FP32 spelling
+        # must be equally compatible when both tensors and configuration match.
+        self.assertNotIn("parameter_dtype", self.lora.state_dict()["config"])
+        self.assertNotIn("parameter_dtype", self.heads.q_state_dict())
+        explicit_fp32 = self.lora.state_dict()
+        explicit_fp32["config"]["parameter_dtype"] = "torch.float32"
+        self.lora.load_state_dict(explicit_fp32)
 
     def _drift(self):
         with torch.no_grad():

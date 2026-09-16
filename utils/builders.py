@@ -93,7 +93,11 @@ def create_generation_model(args):
     else:
         raise ValueError(f"Unsupported model {args.model}")
 
-    model.cuda()
+    # Cast before creating the optimizer and EMA so BF16 training does not
+    # retain a hidden FP32 master copy. Other entry points keep their default.
+    parameter_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[
+        getattr(args, "parameter_dtype", "fp32")]
+    model.to(device="cuda", dtype=parameter_dtype)
     # Broadcast weights from rank 0 before EMA init.
     if is_enabled():
         logger.info("[Model] Broadcasting weights from rank 0 ...")

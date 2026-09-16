@@ -1,4 +1,4 @@
-"""Online Qwen q: one frozen backbone, student/EMA LoRA banks, FP32 heads.
+"""Online Qwen q: one frozen backbone and student/EMA LoRA banks.
 
 Native PyTorch LoRA keeps adapter selection explicit for the image VJP. No
 weights are merged into the base model and no PEFT dependency is required.
@@ -23,17 +23,19 @@ def validate_loss_scale(scale):
 class BankedLoRALinear(torch.nn.Module):
     """W x + (alpha/r) B A x; B=0 makes both q banks equal the base at init."""
 
-    def __init__(self, base, rank, alpha):
+    def __init__(self, base, rank, alpha, *, parameter_dtype=torch.float32):
         super().__init__()
         if rank < 1 or not math.isfinite(alpha) or alpha <= 0:
             raise ValueError("LoRA rank and alpha must be positive")
+        if parameter_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError("LoRA parameter_dtype must be torch.float32 or torch.bfloat16")
         self.base = base.requires_grad_(False)
         self.scaling = float(alpha) / rank
         self.active = "base"
         self.student_a = torch.nn.Parameter(torch.empty(
-            rank, base.in_features, device=base.weight.device, dtype=torch.float32))
+            rank, base.in_features, device=base.weight.device, dtype=parameter_dtype))
         self.student_b = torch.nn.Parameter(torch.zeros(
-            base.out_features, rank, device=base.weight.device, dtype=torch.float32))
+            base.out_features, rank, device=base.weight.device, dtype=parameter_dtype))
         torch.nn.init.kaiming_uniform_(self.student_a, a=math.sqrt(5))
         self.teacher_a = torch.nn.Parameter(self.student_a.detach().clone(), requires_grad=False)
         self.teacher_b = torch.nn.Parameter(self.student_b.detach().clone(), requires_grad=False)
@@ -54,9 +56,10 @@ class BankedLoRALinear(torch.nn.Module):
                 else (self.teacher_a, self.teacher_b))
         if self.active == "student_frozen":
             a, b = a.detach(), b.detach()
-        # Autocast would otherwise downcast FP32 adapters' matrix multiplies.
+        # Adapter storage determines its compute precision independently of the
+        # backbone's autocast. BF16 mode has no FP32 master parameter copy.
         with torch.autocast(device_type=x.device.type, enabled=False):
-            update = F.linear(F.linear(x.float(), a), b) * self.scaling
+            update = F.linear(F.linear(x.to(dtype=a.dtype), a), b) * self.scaling
         return out + update.to(out.dtype)
 
 
@@ -64,7 +67,8 @@ class LoRAQ:
     """Own adapter operations, leaving the extractor/head ownership unchanged."""
 
     def __init__(self, extractor, heads, *, rank=8, alpha=16.0,
-                 scope="both", targets=("q_proj", "k_proj", "v_proj", "o_proj", "qkv", "proj")):
+                 scope="both", targets=("q_proj", "k_proj", "v_proj", "o_proj", "qkv", "proj"),
+                 parameter_dtype=torch.float32):
         if scope not in ("language", "vision", "both"):
             raise ValueError("LoRA scope must be language, vision, or both")
         self.extractor = extractor
@@ -83,7 +87,7 @@ class LoRAQ:
                 continue
             parent_name, _, child_name = name.rpartition(".")
             parent = extractor.vlm.get_submodule(parent_name) if parent_name else extractor.vlm
-            layer = BankedLoRALinear(module, rank, alpha)
+            layer = BankedLoRALinear(module, rank, alpha, parameter_dtype=parameter_dtype)
             setattr(parent, child_name, layer)
             self.layers[name] = layer
         if not self.layers:
@@ -91,6 +95,10 @@ class LoRAQ:
         self.config = {"rank": rank, "alpha": float(alpha), "scope": scope,
                        "targets": list(targets), "modules": list(self.layers),
                        "dtype": str(extractor.compute_dtype), "format_version": 1}
+        # Preserve the legacy FP32 payload while recording a BF16 experiment's
+        # actual parameter precision separately from backbone compute precision.
+        if parameter_dtype != torch.float32:
+            self.config["parameter_dtype"] = str(parameter_dtype)
         # setup() deliberately uses seed+rank. Random A must still be identical
         # across ranks: averaged gradients alone cannot synchronize unequal A.
         if torch.distributed.is_initialized():
@@ -157,7 +165,10 @@ class LoRAQ:
 
     @torch.no_grad()
     def load_state_dict(self, state):
-        if state["config"] != self.config:
+        saved_config, current_config = dict(state["config"]), dict(self.config)
+        saved_config.setdefault("parameter_dtype", str(torch.float32))
+        current_config.setdefault("parameter_dtype", str(torch.float32))
+        if saved_config != current_config:
             raise ValueError("Checkpoint LoRA configuration differs from this run")
         if state["adapters"].keys() != self.layers.keys():
             raise ValueError("Checkpoint LoRA module names differ from this run")
@@ -170,6 +181,8 @@ class LoRAQ:
                 target = getattr(layer, key)
                 if target.shape != value.shape:
                     raise ValueError(f"LoRA shape mismatch for {name}.{key}")
+                if target.dtype != value.dtype:
+                    raise ValueError(f"LoRA parameter dtype mismatch for {name}.{key}")
                 target.copy_(value)
 
     @torch.no_grad()
@@ -179,7 +192,8 @@ class LoRAQ:
             # ||B A||_F^2 = tr((B^T B)(A A^T)); never materialize dense delta W.
             norm_sq = 0.0
             for layer in self.layers.values():
-                a, b = getattr(layer, bank + "_a"), getattr(layer, bank + "_b")
+                a = getattr(layer, bank + "_a").float()
+                b = getattr(layer, bank + "_b").float()
                 norm_sq += float(((b.T @ b) * (a @ a.T)).sum()) * layer.scaling ** 2
             out[f"q_{bank}_lora_delta_l2"] = math.sqrt(max(0.0, norm_sq))
         return out
@@ -229,7 +243,7 @@ class LoRAQ:
         self.extractor.last_stats = {
             "vlm_answer_state_samples": float(selected.numel()),
             "vlm_answer_state_microbatch": float(self.extractor.microbatch_size),
-            "vlm_answer_state_norm": float(z.norm(dim=1).mean()),
+            "vlm_answer_state_norm": float(z.float().norm(dim=1).mean()),
         }
         return surrogate, z, torch.cat(q_log_probs), selected
 
@@ -257,6 +271,13 @@ def load_q_optimizer_state(optimizer, state):
                 raise ValueError(f"checkpoint q optimizer {key}={saved.get(key)!r} differs "
                                  f"from configured {current.get(key)!r}; use --load_from "
                                  "for a new experiment or match the resume configuration")
+        for parameter, saved_id in zip(current["params"], saved["params"]):
+            for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq", "momentum_buffer"):
+                value = state["state"].get(saved_id, {}).get(key)
+                if value is not None and value.dtype != parameter.dtype:
+                    raise ValueError(f"checkpoint q optimizer {key} dtype {value.dtype} differs "
+                                     f"from parameter dtype {parameter.dtype}; use --load_from "
+                                     "for a new precision experiment")
     optimizer.load_state_dict(state)
 
 

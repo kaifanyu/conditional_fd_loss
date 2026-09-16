@@ -65,9 +65,12 @@ def all_gather_plain(tensor: torch.Tensor) -> torch.Tensor:
 
 def precompute_sigma_ref_sqrt(sigma_ref: torch.Tensor) -> torch.Tensor:
     """Precompute sigma_ref^{1/2} via eigendecomposition (one-time cost)."""
-    eigvals, eigvecs = torch.linalg.eigh(sigma_ref)
-    eigvals = torch.clamp(eigvals, min=0)
-    return eigvecs @ torch.diag(eigvals.sqrt()) @ eigvecs.T
+    if sigma_ref.dtype in (torch.float16, torch.bfloat16):
+        sigma_ref = sigma_ref.float()
+    with torch.autocast(device_type=sigma_ref.device.type, enabled=False):
+        eigvals, eigvecs = torch.linalg.eigh(sigma_ref)
+        eigvals = torch.clamp(eigvals, min=0)
+        return eigvecs @ torch.diag(eigvals.sqrt()) @ eigvecs.T
 
 
 def _compute_trace_term(
@@ -113,35 +116,47 @@ def compute_frechet_distance_loss(
 
     Provide either ``all_feats`` (raw feature matrix) or both ``mu`` and ``sigma``.
     When ``all_feats`` is given, mu/sigma are computed internally (requires >= 2 samples).
+    Half-precision inputs are promoted to FP32 before computing moments and
+    matrix decompositions; existing FP64 statistics retain their precision.
     """
-    if all_feats is not None:
-        n_samples = all_feats.shape[0]
-        if n_samples < 2:
-            logger.warning(f"[compute_frechet_distance_loss] Only {n_samples} sample(s) — need >= 2")
-            return torch.tensor(1e6, device=all_feats.device, dtype=torch.float32, requires_grad=True)
-        mu = all_feats.mean(dim=0)
-        feats_c = all_feats - mu
-        sigma = (feats_c.T @ feats_c) / (n_samples - 1)
-    elif mu is None or sigma is None:
+    if all_feats is None and (mu is None or sigma is None):
         raise ValueError("Provide either all_feats or both mu and sigma")
 
-    # Ensure consistent dtype (ref stats may be float64 from numpy)
-    compute_dtype = sigma.dtype
-    mu_ref = mu_ref.to(dtype=compute_dtype)
-    sigma_ref = sigma_ref.to(dtype=compute_dtype)
-    if sigma_ref_sqrt is not None:
-        sigma_ref_sqrt = sigma_ref_sqrt.to(dtype=compute_dtype)
+    # This boundary also covers queue_size=0, where snapshots return the raw
+    # BF16 features. Casting preserves their VJP; autocast must not downcast
+    # the covariance products again before eigvals/eigvalsh.
+    device = all_feats.device if all_feats is not None else mu.device
+    with torch.autocast(device_type=device.type, enabled=False):
+        if all_feats is not None:
+            if all_feats.dtype in (torch.float16, torch.bfloat16):
+                all_feats = all_feats.float()
+            n_samples = all_feats.shape[0]
+            if n_samples < 2:
+                logger.warning(f"[compute_frechet_distance_loss] Only {n_samples} sample(s) — need >= 2")
+                return torch.tensor(1e6, device=device, dtype=torch.float32, requires_grad=True)
+            mu = all_feats.mean(dim=0)
+            feats_c = all_feats - mu
+            sigma = (feats_c.T @ feats_c) / (n_samples - 1)
 
-    diff = mu - mu_ref
-    mean_term = diff.dot(diff)
+        if sigma.dtype in (torch.float16, torch.bfloat16):
+            sigma = sigma.float()
+        compute_dtype = sigma.dtype
+        if mu.dtype in (torch.float16, torch.bfloat16):
+            mu = mu.to(dtype=compute_dtype)
+        mu_ref = mu_ref.to(dtype=compute_dtype)
+        sigma_ref = sigma_ref.to(dtype=compute_dtype)
+        if sigma_ref_sqrt is not None:
+            sigma_ref_sqrt = sigma_ref_sqrt.to(dtype=compute_dtype)
 
-    trace_term = _compute_trace_term(sigma, sigma_ref, sigma_ref_sqrt)
-    if trace_term is None:
-        device = all_feats.device if all_feats is not None else mu.device
-        logger.warning("[compute_frechet_distance_loss] NaN/Inf in covariance product — returning fallback")
-        return torch.tensor(1e6, device=device, dtype=torch.float32)
+        diff = mu - mu_ref
+        mean_term = diff.dot(diff)
 
-    return (mean_term + trace_term).float()
+        trace_term = _compute_trace_term(sigma, sigma_ref, sigma_ref_sqrt)
+        if trace_term is None:
+            logger.warning("[compute_frechet_distance_loss] NaN/Inf in covariance product — returning fallback")
+            return torch.tensor(1e6, device=device, dtype=torch.float32)
+
+        return (mean_term + trace_term).float()
 
 
 # =============================================================================

@@ -109,7 +109,7 @@ class VLMLinearHead(torch.nn.Module):
         self.feature_std.copy_(std)
 
     def normalize(self, z: torch.Tensor) -> torch.Tensor:
-        z = z.float()
+        z = z.to(dtype=self.weight.dtype)
         if self.feature_norm == "none":
             return z
         return (z - self.feature_mean) / self.feature_std
@@ -124,9 +124,12 @@ class VLMLinearHead(torch.nn.Module):
             )
         with torch.autocast(device_type=z.device.type, enabled=False):
             if detach_parameters:
-                return F.linear(self.normalize(z), self.weight.detach(),
-                                self.bias.detach()) / float(temperature)
-            return self.linear(self.normalize(z)) / float(temperature)
+                logits = F.linear(self.normalize(z), self.weight.detach(), self.bias.detach())
+            else:
+                logits = self.linear(self.normalize(z))
+            # Parameters, normalization, and matrix multiplies use the head's
+            # storage dtype. Temperature/CE/log-softmax reductions remain FP32.
+            return logits.float() / float(temperature)
 
     def log_probs(self, z: torch.Tensor, temperature: float = 1.0, *,
                   detach_parameters: bool = False) -> torch.Tensor:
@@ -400,14 +403,14 @@ class VLMDeltaHeads(torch.nn.Module):
                                         self.q_student.linear.parameters()):
             delta = (1.0 - beta) * (student_p.detach() - teacher_p)
             teacher_p.add_(delta)
-            total_sq += float(delta.pow(2).sum())
+            total_sq += float(delta.float().pow(2).sum())
         self._last_teacher_update_norm = math.sqrt(total_sq)
 
     @torch.no_grad()
     def record_student_update(self, before: Sequence[torch.Tensor]) -> None:
         total_sq = 0.0
         for prev, cur in zip(before, self.q_student.linear.parameters()):
-            total_sq += float((cur.detach() - prev).pow(2).sum())
+            total_sq += float((cur.detach().float() - prev.float()).pow(2).sum())
         self._last_student_update_norm = math.sqrt(total_sq)
 
     def student_snapshot(self) -> list[torch.Tensor]:
@@ -419,24 +422,25 @@ class VLMDeltaHeads(torch.nn.Module):
     def drift_metrics(self) -> dict[str, float]:
         """How far q has moved from p, and how fast."""
         out: dict[str, float] = {}
-        p_w, p_b = self.p_weight_ref, self.p_bias_ref
+        p_w, p_b = self.p_weight_ref.float(), self.p_bias_ref.float()
         p_w_norm = max(float(p_w.norm()), 1e-12)
         p_b_norm = max(float(p_b.norm()), 1e-12)
         for name, head in (("q_student", self.q_student), ("q_teacher", self.q_teacher)):
-            dw = head.weight.detach() - p_w
-            db = head.bias.detach() - p_b
+            weight, bias = head.weight.detach().float(), head.bias.detach().float()
+            dw = weight - p_w
+            db = bias - p_b
             out[f"{name}_weight_delta_l2"] = float(dw.norm())
             out[f"{name}_bias_delta_l2"] = float(db.norm())
             out[f"{name}_weight_delta_rel"] = float(dw.norm()) / p_w_norm
             out[f"{name}_bias_delta_rel"] = float(db.norm()) / p_b_norm
             out[f"{name}_weight_cos_to_p"] = float(
-                F.cosine_similarity(head.weight.detach().reshape(1, -1),
+                F.cosine_similarity(weight.reshape(1, -1),
                                     p_w.reshape(1, -1), dim=1)
             )
-            out[f"{name}_weight_norm"] = float(head.weight.detach().norm())
-            out[f"{name}_bias_norm"] = float(head.bias.detach().norm())
+            out[f"{name}_weight_norm"] = float(weight.norm())
+            out[f"{name}_bias_norm"] = float(bias.norm())
         # Per-class drift of the teacher, normalised by the per-class norm of p.
-        per_class = (self.q_teacher.weight.detach() - p_w).norm(dim=1)
+        per_class = (self.q_teacher.weight.detach().float() - p_w).norm(dim=1)
         p_per_class = p_w.norm(dim=1).clamp_min(1e-12)
         rel = per_class / p_per_class
         out["q_teacher_class_weight_delta_mean"] = float(rel.mean())
@@ -485,7 +489,7 @@ class VLMDeltaHeads(torch.nn.Module):
     # -- checkpointing --------------------------------------------------------
 
     def q_state_dict(self) -> dict[str, Any]:
-        return {
+        state = {
             "q_student": {k: v.detach().cpu()
                           for k, v in self.q_student.state_dict().items()},
             "q_teacher": {k: v.detach().cpu()
@@ -495,11 +499,23 @@ class VLMDeltaHeads(torch.nn.Module):
             "use_ema": self.use_ema,
             "temperature": self.temperature,
         }
+        if self.q_student.weight.dtype != torch.float32:
+            state["parameter_dtype"] = str(self.q_student.weight.dtype)
+        return state
 
     def load_q_state_dict(self, state: Mapping[str, Any], *, strict_config=True) -> None:
         if strict_config and bool(state.get("use_ema", True)) != self.use_ema:
             raise ValueError("checkpoint q EMA mode differs from this run; use --load_from "
                              "for a new experiment or --vlm_q_use_ema for a legacy EMA run")
+        if strict_config:
+            parameter_dtype = self.q_student.weight.dtype
+            if state.get("parameter_dtype", str(torch.float32)) != str(parameter_dtype):
+                raise ValueError("checkpoint q parameter dtype differs from this run; use "
+                                 "--load_from for a new precision experiment")
+            for bank in ("q_student", "q_teacher"):
+                if any(value.dtype != parameter_dtype for value in state[bank].values()
+                       if value.is_floating_point()):
+                    raise ValueError(f"checkpoint {bank} tensor dtype differs from this run")
         self.q_student.load_state_dict(state["q_student"], strict=True)
         self.q_teacher.load_state_dict(state["q_teacher"], strict=True)
         self.q_train_steps.fill_(int(state.get("q_train_steps", 0)))

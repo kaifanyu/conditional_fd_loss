@@ -63,6 +63,7 @@ import os
 import sys
 import time
 from collections import deque
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -149,17 +150,23 @@ INSTANT_METERS = (
     "samples_per_class", "vlm_scale_eff",
 )
 
-# Backend-specific meters. These MUST stay out of INSTANT_METERS: a meter that is
-# registered but never updated keeps an empty deque, and MetricLogger.__str__
-# calls max() on it at the first print -- which crashes the run at step 0 (or at
-# the first print after a resume). Register them only when the backend that
-# produces them is active.
+# Backend-specific meters belong to the backend that produces them. All instant
+# meters are registered lazily, so an absent diagnostic cannot leave an empty
+# window or lose its window size when it first appears after resume.
 BACKEND_INSTANT_METERS = {
     P_HEAD_BACKEND_QWEN: (
         "vlm_answer_state_samples", "vlm_answer_state_microbatch",
         "vlm_answer_state_norm",
     ),
 }
+
+
+def update_training_metrics(metric_logger, instant_meters, **metrics):
+    """Register instant meters when first observed, including after resume."""
+    for name in instant_meters:
+        if metrics.get(name) is not None and name not in metric_logger.meters:
+            metric_logger.add_meter(name, SmoothedValue(1, "{value:.6f}"))
+    metric_logger.update(**metrics)
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +450,9 @@ def setup_vlm_delta(judges, judge_model_names, args):
     heads = VLMDeltaHeads(p_head, temperature=temperature,
                           ema_beta=args.vlm_q_ema_beta,
                           use_ema=args.vlm_q_use_ema).cuda()
+    parameter_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[
+        getattr(args, "parameter_dtype", "fp32")]
+    heads.to(dtype=parameter_dtype)
 
     # How many times q trains on any one generated sample.  A sample lives in the
     # buffer for buffer_size/global_batch steps and each update draws q_batch of
@@ -469,7 +479,7 @@ def setup_vlm_delta(judges, judge_model_names, args):
     if use_lora:
         lora = LoRAQ(judge["vlm_extractor"], heads, rank=args.vlm_q_lora_rank,
                      alpha=args.vlm_q_lora_alpha, scope=args.vlm_q_lora_scope,
-                     targets=args.vlm_q_lora_targets)
+                     targets=args.vlm_q_lora_targets, parameter_dtype=parameter_dtype)
         logger.info("[LoRA q] %d adapted modules, %d student adapter parameters; "
                     "training on fresh scored images (feature replay/bootstrap and "
                     "--vlm_q_batch_size do not apply). Config: %s",
@@ -662,7 +672,8 @@ def _diag_images(sampled, selected):
     return images.detach()
 
 
-def training_judge_features(judge, images, *, microbatch=0, checkpoint_features=False):
+def training_judge_features(judge, images, *, microbatch=0, checkpoint_features=False,
+                            amp_dtype=None):
     """Bound FD activation memory while retaining gradients of the full batch.
 
     Frozen judges are in eval mode, so images can be evaluated independently.
@@ -671,6 +682,8 @@ def training_judge_features(judge, images, *, microbatch=0, checkpoint_features=
     """
     if microbatch < 0:
         raise ValueError("fd_feature_microbatch must be non-negative")
+    if amp_dtype is not None:
+        judge = {**judge, "amp_dtype": amp_dtype}
     forward = partial(extract_judge_features, judge)
     chunks = images.split(microbatch or images.shape[0])
     features = []
@@ -683,7 +696,7 @@ def training_judge_features(judge, images, *, microbatch=0, checkpoint_features=
 
 
 def training_generated_images(model, noise, labels, sampling_args, *,
-                              microbatch=0, checkpoint_generator=False):
+                              microbatch=0, checkpoint_generator=False, amp_dtype=None):
     """Checkpoint each generator microbatch to bound backward recomputation.
 
     Concatenate images before computing any batch statistics or loss. This
@@ -696,13 +709,20 @@ def training_generated_images(model, noise, labels, sampling_args, *,
         raise ValueError("generator noise and labels must have the same batch size")
     size = microbatch or noise.shape[0]
     images = []
+    def forward(z, y):
+        context = (torch.autocast(z.device.type, dtype=amp_dtype)
+                   if amp_dtype is not None else nullcontext())
+        with context:
+            return model.sample_images_with_grad(z, y, sampling_args=sampling_args)
+
     for z, y in zip(noise.split(size), labels.split(size)):
         if checkpoint_generator and torch.is_grad_enabled():
-            images.append(checkpoint(model.sample_images_with_grad, z, y,
-                                     sampling_args=sampling_args, use_reentrant=False))
+            images.append(checkpoint(forward, z, y, use_reentrant=False))
         else:
-            images.append(model.sample_images_with_grad(z, y, sampling_args=sampling_args))
-    return torch.cat(images, dim=0)
+            images.append(forward(z, y))
+    # Pixel-space losses/VJPs accumulate in FP32; this is not a master weight
+    # or parameter update. Autograd still reaches BF16 generator parameters.
+    return torch.cat(images, dim=0).float()
 
 
 def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
@@ -715,6 +735,7 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
     vlm_answer_state = (vlm_judge is not None
                         and vlm_judge.get("vlm_backend") == P_HEAD_BACKEND_QWEN)
     lora = None if vlm_judge is None else vlm_judge.get("vlm_lora")
+    amp_dtype = getattr(args, "amp_dtype", None) if getattr(args, "enable_amp", False) else None
 
     train_class_ids = getattr(args, "train_class_ids", None)
     train_class_ids_tensor = (
@@ -737,7 +758,8 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
         sampled = training_generated_images(
             model_wo_ddp, z_noise, y, sampling_args,
             microbatch=getattr(args, "generator_microbatch", 0),
-            checkpoint_generator=getattr(args, "grad_checkpointing", False))
+            checkpoint_generator=getattr(args, "grad_checkpointing", False),
+            amp_dtype=amp_dtype)
         if tokenizer is not None:
             sampled = tokenizer.decode(tokenizer.denormalize_z(sampled))
         sampled = (sampled * 0.5 + 0.5).clamp(0, 1)  # [-1,1] -> [0,1]
@@ -748,7 +770,8 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
         all_new_feats = [diff_all_gather(training_judge_features(
                             judge, sampled,
                             microbatch=getattr(args, "fd_feature_microbatch", 0),
-                            checkpoint_features=getattr(args, "fd_feature_checkpoint", False)))
+                            checkpoint_features=getattr(args, "fd_feature_checkpoint", False),
+                            amp_dtype=amp_dtype))
                          for judge in judges]
 
         fd_term = torch.zeros((), device="cuda")
@@ -957,7 +980,7 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
                 y_alt = torch.roll(y, 1, dims=0)
                 alt = training_generated_images(
                     model_wo_ddp, z_noise, y_alt, sampling_args,
-                    microbatch=getattr(args, "generator_microbatch", 0))
+                    microbatch=getattr(args, "generator_microbatch", 0), amp_dtype=amp_dtype)
                 if tokenizer is not None:
                     alt = tokenizer.decode(tokenizer.denormalize_z(alt))
                 alt = (alt * 0.5 + 0.5).clamp(0, 1)
@@ -1025,7 +1048,8 @@ def initial_generated_diagnostics(vlm_judge, model, args, tokenizer=None, probe=
     while collected < n_target:
         bsz = min(args.fd_queue_fill_bsz, n_target - collected)
         y = ids[torch.randint(0, ids.numel(), (bsz,), device="cuda")]
-        imgs = model.generate(bsz, y, cfg=args.cfg, args=args, verbose=False)
+        with torch.autocast(y.device.type, dtype=args.amp_dtype, enabled=args.enable_amp):
+            imgs = model.generate(bsz, y, cfg=args.cfg, args=args, verbose=False)
         imgs = tokenizer.detokenize(imgs) if tokenizer is not None else imgs * 0.5 + 0.5
         z = diff_all_gather(vlm_features_no_grad(vlm_judge, imgs, args)).detach()
         y_all = all_gather_plain(y)
@@ -1150,6 +1174,10 @@ def print_initial_diagnostics(report) -> None:
 # ---------------------------------------------------------------------------
 
 def train_and_evaluate(args):
+    parameter_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[
+        getattr(args, "parameter_dtype", "fp32")]
+    if parameter_dtype == torch.bfloat16 and (args.dtype != "bf16" or args.vlm_dtype != "bf16"):
+        raise ValueError("--parameter_dtype bf16 requires --dtype bf16 and --vlm_dtype bf16")
     if args.vlm_disable_tf32:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
@@ -1157,6 +1185,11 @@ def train_and_evaluate(args):
         getattr(args, "train_class_ids", None), args.num_classes)
     validate_vlm_takeoff_gate_args(args)
     wandb_logger = setup(args)
+    args.training_amp_dtype = args.amp_dtype if args.enable_amp else None
+    logger.info("[Precision] neural compute=%s, generator/head/LoRA parameters=%s; "
+                "AdamW moments follow parameter dtype, no separate master weights. "
+                "FD EMA statistics/eigensolve remain FP64; image VJPs/reductions FP32.",
+                args.dtype, getattr(args, "parameter_dtype", "fp32"))
     # SIGTERM here, not just SIGUSR1: on shared GPUs an eviction arrives as
     # SIGTERM, and both earlier trials of this experiment died to one mid-step.
     # Best-effort -- the supervisor in scripts/supervise_vlm_delta.sh is what
@@ -1201,6 +1234,7 @@ def train_and_evaluate(args):
         args.fd_repr_weights, args.fd_repr_pool_types, args.fd_target_sizes,
     ):
         repr_model, feat_dim, _, _ = load_repr_model(name, target_size=ts)
+        repr_model.to(dtype=parameter_dtype)
         mu_ref, sigma_ref = load_mu_and_sigma_reference(stats_path, pool_type=pool_type)
         queue = FeatureQueue(size=args.queue_size, feat_dim=feat_dim,
                              online_accum=args.fd_online_accum,
@@ -1211,6 +1245,7 @@ def train_and_evaluate(args):
             "name": short, "model": repr_model, "feat_dim": feat_dim,
             "pool_type": pool_type, "mu_ref": mu_ref, "sigma_ref": sigma_ref,
             "sigma_ref_sqrt": sigma_ref_sqrt, "queue": queue, "weight": weight,
+            "amp_dtype": args.training_amp_dtype,
         })
         judge_model_names.append(name)
         logger.info("[FD] Repr '%s' (%s): feat_dim=%d, weight=%s, pool=%s, stats=%s",
@@ -1343,16 +1378,13 @@ def train_and_evaluate(args):
                 f"{args.current_step:,}", f"{args.total_steps:,}",
                 args.start_epoch, args.epochs)
     # The generator gradient is all-reduced with AVG while every rank computes
-    # the loss over the *globally gathered* batch, so the applied gradient is
-    # 1/world_size of the true full-batch gradient and the EFFECTIVE learning
-    # rate scales as lr/world_size.  Verified numerically at W=1,2,3.  Print it
-    # so a run resumed at a different world size cannot silently change step
-    # size mid-trajectory.
+    # the loss over the globally gathered batch. Report the actual optimizer
+    # LR: AdamW's moment normalization means gradient averaging cannot be
+    # represented by dividing the learning rate by world_size.
     logger.info(
-        "[LR] lr=%.3g over world_size=%d -> effective lr=%.4g per optimizer step "
-        "(global batch %d = %d/rank). A resume at a different world size MUST "
-        "rescale --lr to keep this constant.",
-        args.lr, args.world_size, args.lr / max(1, args.world_size),
+        "[LR] optimizer lr=%.3g over world_size=%d "
+        "(global batch %d = %d/rank); generator gradients are averaged across ranks.",
+        args.lr, args.world_size,
         args.batch_size * args.world_size, args.batch_size)
 
     global_bsz = args.batch_size * args.world_size
@@ -1392,9 +1424,9 @@ def train_and_evaluate(args):
         BACKEND_INSTANT_METERS.get(vlm_judge.get("vlm_backend"), ()))
     if not heads.use_ema:
         instant_meters = [name for name in instant_meters if not name.startswith("q_teacher_")]
-    for name in instant_meters:
-        metric_logger.add_meter(name, SmoothedValue(1, "{value:.6f}"))
-    first_step_of_process = args.current_step
+    # Register only when a value arrives. A resumed first step may not run
+    # diagnostics; pre-registering empty meters then deleting them would let
+    # MetricLogger recreate those diagnostics with its default window of 20.
 
     def _infinite():
         while True:
@@ -1463,28 +1495,13 @@ def train_and_evaluate(args):
                   if torch.cuda.is_available() else 0.0)
         loss_dict["samples_per_class"] = args.samples_seen / max(1, heads.num_classes)
 
-        metric_logger.update(
+        update_training_metrics(
+            metric_logger, instant_meters,
             loss=loss_value, grad_norm=grad_norm,
             lr=optimizer.param_groups[0]["lr"],
             **{"samples/s/device": sps, "samples/s": sps * args.world_size,
                "samples_seen(M)": args.samples_seen / 1e6, "device_mem(GB)": mem_gb},
             **loss_dict)
-
-        if step == first_step_of_process:
-            # A pre-registered meter that the step never produces keeps an empty
-            # deque, and MetricLogger.__str__ calls max() on it at the very first
-            # print -- killing the run at step 0, or immediately after a resume.
-            # Drop any such meter instead of crashing; warn, because it means a
-            # metric someone expected is missing.
-            stale = [n for n in instant_meters
-                     if not metric_logger.meters[n].deque]
-            for name in stale:
-                del metric_logger.meters[name]
-            if stale:
-                logger.warning(
-                    "[metrics] %d registered meter(s) were not produced by the "
-                    "training step and have been dropped so logging cannot crash "
-                    "on an empty window: %s", len(stale), ", ".join(stale))
 
         # -- per-class accumulation and periodic dump --
         if diag and sampled_detached is not None:
@@ -1658,7 +1675,8 @@ def bootstrap_vlm_buffer(vlm_judge, model, args, tokenizer=None):
     while filled < args.vlm_q_bootstrap:
         bsz = min(args.fd_queue_fill_bsz, args.vlm_q_bootstrap - filled)
         y = ids[torch.randint(0, ids.numel(), (bsz,), device="cuda")]
-        imgs = model.generate(bsz, y, cfg=args.cfg, args=args, verbose=False)
+        with torch.autocast(y.device.type, dtype=args.amp_dtype, enabled=args.enable_amp):
+            imgs = model.generate(bsz, y, cfg=args.cfg, args=args, verbose=False)
         imgs = tokenizer.detokenize(imgs) if tokenizer is not None else imgs * 0.5 + 0.5
         z = diff_all_gather(vlm_features_no_grad(vlm_judge, imgs, args)).detach()
         buffer.push(z.float(), class_map.to_local(all_gather_plain(y)))
@@ -2064,6 +2082,9 @@ def get_args_parser():
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--dtype", default="bf16", type=str,
                         choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--parameter_dtype", default="fp32", choices=["fp32", "bf16"],
+                        help="generator, FD-network and p/q/LoRA parameter storage; "
+                             "bf16 uses BF16 optimizer moments without FP32 master weights")
     parser.add_argument("--compile", action="store_true",
                         help="unsupported here: the per-term image-gradient "
                              "diagnostics this experiment is calibrated on need "
